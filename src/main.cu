@@ -12,11 +12,10 @@
 // ---------- Constants ----------
 constexpr uint32_t N_ACCS        = 1u << 30;
 constexpr uint32_t N_ADDR        = 1u << 27;
-constexpr uint32_t INSTANCE_SIZE = 1u << 22;
-constexpr uint32_t NUM_INSTANCES = N_ACCS / INSTANCE_SIZE;  // 128
-constexpr uint32_t NUM_ACTIVE    = NUM_INSTANCES / 16;      // how many instances to actually fill
+constexpr uint32_t INSTANCE_SIZE   = 1u << 22;
+constexpr uint32_t NUM_INSTANCES   = N_ACCS / INSTANCE_SIZE;constexpr uint32_t NUM_ACTIVE    = NUM_INSTANCES / 16; // how many instances to actually fill
 constexpr uint32_t CHUNK_SIZE    = 1u << 18;
-constexpr uint32_t NUM_CHUNKS    = N_ACCS / CHUNK_SIZE;  // 1024
+constexpr uint32_t NUM_CHUNKS    = N_ACCS / CHUNK_SIZE;  
     
 // ---------- GPU kernels ----------
 
@@ -35,7 +34,7 @@ __global__ void instance_boundaries_kernel(
     uint32_t inst = threadIdx.x;
     if (inst >= NUM_INSTANCES) return;
 
-    uint32_t inst_start = inst * INSTANCE_SIZE;
+    uint32_t inst_start = (inst > 0) ? (inst * INSTANCE_SIZE - 1) : 0;
     uint32_t inst_end = (inst < NUM_INSTANCES - 1) ? (inst + 1) * INSTANCE_SIZE : N_ACCS;
 
     // Find largest address <= inst_start
@@ -280,7 +279,7 @@ void gpu_metadata(const uint32_t* h_accs,
                    n_entries * sizeof(uint32_t), cudaMemcpyDeviceToHost);
         total_prefix_bytes += n_entries * sizeof(uint32_t);
 
-        uint32_t out_start = inst * INSTANCE_SIZE;
+        uint32_t out_start = (inst > 0) ? (inst * INSTANCE_SIZE - 1) : 0;
         metas[i].instance_offsets.resize(n_entries);
         for (uint32_t j = 0; j < n_entries; j++)
             metas[i].instance_offsets[j] = (int32_t)(tmp[j] - out_start);
@@ -341,7 +340,9 @@ void cpu_fill_instances(const uint32_t* h_accs, const uint32_t* h_vals,
     #pragma omp parallel for schedule(dynamic, 1)
     for (size_t idx = 0; idx < metas.size(); idx++) {
         auto& m = metas[idx];
-        uint32_t out_base = m.inst_id * INSTANCE_SIZE;
+        uint32_t out_base    = (m.inst_id > 0) ? m.inst_id * INSTANCE_SIZE - 1 : 0;
+        int32_t  owned_start = (m.inst_id > 0) ? 1 : 0;  // skip halo slot
+        int32_t  owned_end   = owned_start + INSTANCE_SIZE;
 
         uint32_t total_written = 0;
         for (size_t ci = 0; ci < m.chunks.size(); ci++) {
@@ -353,7 +354,7 @@ void cpu_fill_instances(const uint32_t* h_accs, const uint32_t* h_vals,
                 if (addr < m.first_addr || addr > m.last_addr) continue;
                 uint32_t ind = addr - m.first_addr;
                 int32_t pos = m.instance_offsets[ind]++;
-                if (pos >= 0 && pos < (int32_t)INSTANCE_SIZE) {
+                if (pos >= owned_start && pos < owned_end) {
                     out_accs[out_base + pos] = addr;
                     out_vals[out_base + pos] = h_vals[base + j];
                     total_written++;
@@ -394,12 +395,15 @@ void verify_instances(const uint32_t* out_accs, const uint32_t* out_vals,
     double t = omp_get_wtime();
     uint32_t total_verified = 0;
     for (const auto& m : metas) {
-        uint32_t gid = m.inst_id * INSTANCE_SIZE;
-        for (uint32_t i = gid; i < gid + INSTANCE_SIZE; i++) {
-            if (out_accs[i] != ref_accs[i] || out_vals[i] != ref_vals[i]) {
-                std::cout << "MISMATCH at position " << i << " (instance " << m.inst_id
-                          << "): got (" << out_accs[i] << "," << out_vals[i]
-                          << ") expected (" << ref_accs[i] << "," << ref_vals[i] << ")" << std::endl;
+        uint32_t inst = m.inst_id;
+        uint32_t start = inst * INSTANCE_SIZE;
+
+        for (uint32_t j = 0; j < INSTANCE_SIZE; j++) {
+            uint32_t ind = start + j;
+            if (out_accs[ind] != ref_accs[ind] || out_vals[ind] != ref_vals[ind]) {
+                std::cout << "MISMATCH at ref position " << ind << " (instance " << inst
+                          << ", local " << j << "): got (" << out_accs[ind] << "," << out_vals[ind]
+                          << ") expected (" << ref_accs[ind] << "," << ref_vals[ind] << ")" << std::endl;
                 return;
             }
         }
@@ -431,8 +435,9 @@ int main() {
     gpu_metadata(accs, active, metas);
 
     // CPU fill active instances
-    uint32_t* out_accs = new uint32_t[N_ACCS];
-    uint32_t* out_vals = new uint32_t[N_ACCS];
+    constexpr size_t OUT_BUF_SIZE = (size_t)NUM_INSTANCES * INSTANCE_SIZE;
+    uint32_t* out_accs = new uint32_t[OUT_BUF_SIZE]();
+    uint32_t* out_vals = new uint32_t[OUT_BUF_SIZE]();
     cpu_fill_instances(accs, vals, out_accs, out_vals, metas);
 
     // CPU reference (full sort — needed to verify)
