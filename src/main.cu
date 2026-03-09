@@ -411,8 +411,8 @@ class PairSortGPU {
     
     // Host pinned
     uint32_t *h_ops;
-    uint32_t *h_prefix_buf;
-    size_t h_prefix_buf_size;  // in bytes
+    uint32_t *h_offsets_buf;
+    size_t h_offsets_buf_size;  // in bytes
     uint32_t *h_result_nops;
     uint32_t *h_meta_scalars;
 
@@ -470,8 +470,8 @@ PairSortGPU::PairSortGPU()
 
     // Host pinned
     cudaMallocHost(&h_ops, (size_t)N_OPS * sizeof(uint32_t));
-    h_prefix_buf_size = 1ull << 28;  // 256 MB
-    cudaMallocHost(&h_prefix_buf, h_prefix_buf_size);
+    h_offsets_buf_size = 1ull << 28;  // 256 MB
+    cudaMallocHost(&h_offsets_buf, h_offsets_buf_size);
     cudaMallocHost(&h_result_nops, (size_t)NUM_ACTIVE * NUM_CHUNKS * sizeof(uint32_t));
     cudaMallocHost(&h_meta_scalars, (size_t)NUM_ACTIVE * 4 * sizeof(uint32_t));
 
@@ -491,7 +491,7 @@ PairSortGPU::PairSortGPU()
                      + (size_t)NUM_ACTIVE * (INSTANCE_SIZE + 1) * sizeof(uint32_t) // d_addr_offsets
                      + (size_t)NUM_ACTIVE * sizeof(uint32_t);                    // d_offset_starts
     size_t pinned_bytes = (size_t)N_OPS * sizeof(uint32_t)                       // h_ops
-                        + h_prefix_buf_size                                       // h_prefix_buf
+                        + h_offsets_buf_size                                       // h_offsets_buf
                         + (size_t)NUM_ACTIVE * NUM_CHUNKS * sizeof(uint32_t)      // h_result_nops
                         + (size_t)NUM_ACTIVE * 4 * sizeof(uint32_t);             // h_meta_scalars
     std::cout << "=== Setup ===" << std::endl
@@ -540,7 +540,7 @@ PairSortGPU::~PairSortGPU() {
 
     // Host
     cudaFreeHost(h_ops);
-    cudaFreeHost(h_prefix_buf);
+    cudaFreeHost(h_offsets_buf);
     cudaFreeHost(h_result_nops);
     cudaFreeHost(h_meta_scalars);
     delete[] h_vals;
@@ -658,7 +658,7 @@ void PairSortGPU::gpu_metadata() {
                     cudaMemcpyDeviceToHost, meta_stream);
 
     // Queue addr_offsets D2H after kernel completes (same stream)
-    cudaMemcpyAsync(h_prefix_buf, d_addr_offsets, total_offsets_bytes,
+    cudaMemcpyAsync(h_offsets_buf, d_addr_offsets, total_offsets_bytes,
                     cudaMemcpyDeviceToHost, d2h_stream);
 
     // Wait for both streams
@@ -675,7 +675,7 @@ void PairSortGPU::gpu_metadata() {
         metas[i].first_addr_skip = sc[1];
         metas[i].last_addr_chunk = sc[2];
         metas[i].last_addr_include = sc[3];
-        metas[i].addr_offsets = h_prefix_buf + h_offset_starts[i];
+        metas[i].addr_offsets = h_offsets_buf + h_offset_starts[i];
         metas[i].nops_per_chunk = h_result_nops + i * NUM_CHUNKS;
     }
 
