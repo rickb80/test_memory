@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <algorithm>
 #include <iomanip>
@@ -9,7 +10,10 @@
 #include <cub/device/device_scan.cuh>
 
 // ---------- Constants ----------
-constexpr uint32_t N_ADDR = 1u << 27;
+constexpr uint32_t N_ADDR = 1u << 26;
+constexpr uint32_t RAM_BASE = 0xA0000000u;
+constexpr uint32_t RAM_END  = 0xBFFFFFFFu;
+constexpr uint32_t ADDR_SHIFT = 3;
 constexpr uint32_t INSTANCE_SIZE = 1u << 22;
 constexpr uint32_t MAX_INSTANCES = 256;
 constexpr uint32_t MASK_INSTANCES_WORDS = MAX_INSTANCES / 32;
@@ -31,6 +35,13 @@ __global__ void extract_active_ids_kernel(
             d_active_ids[count++] = i;
     }
     *d_num_active = count;
+}
+
+__global__ void shift_addresses_kernel(uint32_t* ops, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t stride = gridDim.x * blockDim.x;
+    for (; i < n; i += stride)
+        ops[i] = (ops[i] - RAM_BASE) >> ADDR_SHIFT;
 }
 
 __global__ void histogram_kernel(const uint32_t* ops, uint32_t* hist, uint32_t n) {
@@ -454,7 +465,7 @@ public:
     ~PairSortGPU();
 
     void pick_active_instances();
-    void generate();
+    void generate(uint32_t block_number);
     void gpu_metadata();
     void cpu_fill();
     void reference_sort();
@@ -592,44 +603,80 @@ PairSortGPU::~PairSortGPU() {
     delete[] ref_vals;
 }
 
-void PairSortGPU::generate() {
-    std::cout << std::endl << "=== Generate ===" << std::endl;
+void PairSortGPU::generate(uint32_t block_number) {
+    std::cout << std::endl << "=== Generate (block " << block_number << ") ===" << std::endl;
     double t = omp_get_wtime();
-
-    num_instances = 80;
-    n_ops = num_instances * INSTANCE_SIZE;
-
-    // Generate variable chunk sizes between 2^16 and 2^21
-    std::mt19937 rng(42);
-    std::uniform_int_distribution<uint32_t> chunk_dist(1u << 16, 1u << 21);
 
     chunk_offsets.clear();
     chunk_offsets.push_back(0);
-    uint32_t accumulated = 0;
-    while (accumulated < n_ops) {
-        uint32_t sz = chunk_dist(rng);
-        if (accumulated + sz > n_ops)
-            sz = n_ops - accumulated;
-        accumulated += sz;
-        chunk_offsets.push_back(accumulated);
+    uint32_t total_ops = 0;
+
+    std::vector<uint32_t> raw_buf;
+    char path[512];
+
+    for (uint32_t file_idx = 0; ; file_idx++) {
+        snprintf(path, sizeof(path), "data/%u/mem_addr_%04u.bin", block_number, file_idx);
+        FILE* f = fopen(path, "rb");
+        if (!f) break;
+
+        fseek(f, 0, SEEK_END);
+        size_t file_size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        uint32_t n_entries = file_size / sizeof(uint32_t);
+
+        raw_buf.resize(n_entries);
+        (void)fread(raw_buf.data(), sizeof(uint32_t), n_entries, f);
+        fclose(f);
+
+        // Filter RAM addresses, store raw in h_ops
+        uint32_t chunk_count = 0;
+        for (uint32_t i = 0; i < n_entries; i++) {
+            uint32_t addr = raw_buf[i];
+            if (addr >= RAM_BASE && addr <= RAM_END) {
+                h_ops[total_ops + chunk_count] = addr;
+                chunk_count++;
+            }
+        }
+
+        if (chunk_count > 0) {
+            total_ops += chunk_count;
+            chunk_offsets.push_back(total_ops);
+        }
+
         if (chunk_offsets.size() - 1 >= MAX_CHUNKS) break;
+    }
+
+    // Truncate to whole instances
+    num_instances = total_ops / INSTANCE_SIZE;
+    if (num_instances == 0) {
+        std::cerr << "  ERROR: not enough RAM ops for even 1 instance" << std::endl;
+        exit(1);
+    }
+    n_ops = num_instances * INSTANCE_SIZE;
+
+    // Trim chunk_offsets to fit n_ops - temporary hack
+    while (chunk_offsets.size() > 1 && chunk_offsets.back() > n_ops) {
+        if (chunk_offsets[chunk_offsets.size() - 2] >= n_ops) {
+            chunk_offsets.pop_back();
+        } else {
+            chunk_offsets.back() = n_ops;
+            break;
+        }
     }
     num_chunks = chunk_offsets.size() - 1;
 
-    // Generate random ops and vals
-    std::uniform_int_distribution<uint32_t> addr_dist(0, N_ADDR - 1);
-    std::uniform_int_distribution<uint32_t> val_dist(0, UINT32_MAX);
-    for (uint32_t i = 0; i < n_ops; i++) {
-        h_ops[i] = addr_dist(rng);
-        h_vals[i] = val_dist(rng);
-    }
+    // Set values (global index)
+    for (uint32_t i = 0; i < n_ops; i++)
+        h_vals[i] = i;
 
     // Copy chunk_offsets to GPU
     cudaMemcpy(d_chunk_offsets, chunk_offsets.data(),
                (num_chunks + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
     std::cout << std::fixed << std::setprecision(2)
-              << "  " << n_ops << " pairs in " << num_chunks << " chunks"
+              << "  " << n_ops << " ops (" << total_ops << " total RAM, "
+              << total_ops - n_ops << " trimmed)"
+              << " in " << num_chunks << " chunks, " << num_instances << " instances"
               << " (" << (omp_get_wtime() - t) * 1e3 << " ms)" << std::endl;
 }
 
@@ -640,10 +687,12 @@ void PairSortGPU::gpu_metadata() {
     // Clear histogram
     cudaMemset(d_hist, 0, (size_t)N_ADDR * sizeof(uint32_t));
 
-    // H2D + histogram pipelined by chunks
+    // H2D + shift + histogram pipelined by chunks
     t = omp_get_wtime();
     int hist_block, hist_grid;
     cudaOccupancyMaxPotentialBlockSize(&hist_grid, &hist_block, histogram_kernel, 0, 0);
+    int shift_block, shift_grid;
+    cudaOccupancyMaxPotentialBlockSize(&shift_grid, &shift_block, shift_addresses_kernel, 0, 0);
     for (uint32_t c = 0; c < num_chunks - 1; c++) {
         int s = c % N_STREAMS;
         uint32_t offset = chunk_offsets[c];
@@ -651,6 +700,8 @@ void PairSortGPU::gpu_metadata() {
         size_t chunk_bytes = (size_t)chunk_size * sizeof(uint32_t);
         cudaMemcpyAsync(d_ops + offset, h_ops + offset, chunk_bytes,
                         cudaMemcpyHostToDevice, streams[s]);
+        shift_addresses_kernel<<<shift_grid, shift_block, 0, streams[s]>>>(
+            d_ops + offset, chunk_size);
         histogram_kernel<<<hist_grid, hist_block, 0, streams[s]>>>(
             d_ops + offset, d_hist, chunk_size);
     }
@@ -665,6 +716,8 @@ void PairSortGPU::gpu_metadata() {
         size_t chunk_bytes = (size_t)chunk_size * sizeof(uint32_t);
         cudaMemcpyAsync(d_ops + offset, h_ops + offset, chunk_bytes,
                         cudaMemcpyHostToDevice, streams[s]);
+        shift_addresses_kernel<<<shift_grid, shift_block, 0, streams[s]>>>(
+            d_ops + offset, chunk_size);
         histogram_kernel<<<hist_grid, hist_block, 0, streams[s]>>>(
             d_ops + offset, d_hist, chunk_size);
     }
@@ -783,7 +836,8 @@ void PairSortGPU::cpu_fill() {
             uint32_t last_found = 0;
 
             for (uint32_t j = 0; j < chunk_size && found < expected; j++) {
-                uint32_t addr = h_ops[chunk_start + j];
+                uint32_t raw = h_ops[chunk_start + j];
+                uint32_t addr = (raw - RAM_BASE) >> ADDR_SHIFT;
                 if (addr < m.first_addr || addr > m.last_addr) continue;
                 uint32_t ind = addr - m.first_addr;
                 found++;
@@ -808,7 +862,7 @@ void PairSortGPU::cpu_fill() {
                 uint32_t pos = m.addr_offsets[ind]++;
                 if (pos == 0) continue;  // halo entry (inst > 0); inst==0 starts at 1
                 uint32_t out_pos = out_base + pos - 1;
-                out_ops[out_pos] = addr;
+                out_ops[out_pos] = raw;
                 out_vals[out_pos] = h_vals[chunk_start + j];
                 total_written++;
                 if (total_written >= INSTANCE_SIZE) break;
@@ -867,11 +921,19 @@ void PairSortGPU::verify() {
 
 int main(int argc, char** argv) {
     bool do_verify = false;
-    for (int i = 1; i < argc; i++)
+    uint32_t block_number = 0;
+    bool have_block = false;
+    for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "-v") do_verify = true;
+        else { block_number = std::strtoul(argv[i], nullptr, 10); have_block = true; }
+    }
+    if (!have_block) {
+        std::cerr << "Usage: " << argv[0] << " <block_number> [-v]" << std::endl;
+        return 1;
+    }
 
     PairSortGPU app;
-    app.generate();
+    app.generate(block_number);
     app.pick_active_instances();
     app.gpu_metadata();
     app.cpu_fill();
