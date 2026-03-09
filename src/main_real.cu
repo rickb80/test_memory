@@ -175,7 +175,8 @@ __global__ void build_metas_kernel(
     uint32_t* d_result_nops,         // output + scratch: [num_active][num_chunks]
     uint32_t* d_meta_scalars,        // output: [num_active][4]
     uint32_t num_active,
-    uint32_t num_chunks)
+    uint32_t num_chunks,
+    uint32_t n_ops)
 {
     const uint32_t ai = blockIdx.x;
     if (ai >= num_active) return;
@@ -243,14 +244,15 @@ __global__ void build_metas_kernel(
 
         s_single_addr = single_addr;
 
+        uint32_t inst_size = min(INSTANCE_SIZE, n_ops - inst * INSTANCE_SIZE);
         uint32_t halo_base = (inst == 0) ? 0 : inst * INSTANCE_SIZE - 1;
         s_first_addr_total_skip = halo_base - d_prefix[fa];
 
         if (!single_addr) {
             uint32_t filled_before_last = d_prefix[fa + n_addrs - 1] - inst * INSTANCE_SIZE;
-            s_last_addr_total_include = INSTANCE_SIZE - filled_before_last;
+            s_last_addr_total_include = inst_size - filled_before_last;
         } else {
-            s_last_addr_total_include = INSTANCE_SIZE;
+            s_last_addr_total_include = inst_size;
             if (inst > 0) s_last_addr_total_include++;  // +1 for halo row
         }
     }
@@ -587,7 +589,7 @@ PairSortGPU::~PairSortGPU() {
 
     // Streams
     for (int s = 0; s < N_STREAMS; s++)
-        cudaStreamDestroy(streams[s]);
+    cudaStreamDestroy(streams[s]);
     cudaStreamDestroy(d2h_stream);
     cudaStreamDestroy(meta_stream);
 
@@ -646,22 +648,11 @@ void PairSortGPU::generate(uint32_t block_number) {
         if (chunk_offsets.size() - 1 >= MAX_CHUNKS) break;
     }
 
-    // Truncate to whole instances
-    num_instances = total_ops / INSTANCE_SIZE;
+    n_ops = total_ops;
+    num_instances = (n_ops + INSTANCE_SIZE - 1) / INSTANCE_SIZE;
     if (num_instances == 0) {
-        std::cerr << "  ERROR: not enough RAM ops for even 1 instance" << std::endl;
+        std::cerr << "  ERROR: no RAM ops found" << std::endl;
         exit(1);
-    }
-    n_ops = num_instances * INSTANCE_SIZE;
-
-    // Trim chunk_offsets to fit n_ops - temporary hack
-    while (chunk_offsets.size() > 1 && chunk_offsets.back() > n_ops) {
-        if (chunk_offsets[chunk_offsets.size() - 2] >= n_ops) {
-            chunk_offsets.pop_back();
-        } else {
-            chunk_offsets.back() = n_ops;
-            break;
-        }
     }
     num_chunks = chunk_offsets.size() - 1;
 
@@ -673,10 +664,10 @@ void PairSortGPU::generate(uint32_t block_number) {
     cudaMemcpy(d_chunk_offsets, chunk_offsets.data(),
                (num_chunks + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
+    uint32_t last_inst_size = n_ops - (num_instances - 1) * INSTANCE_SIZE;
     std::cout << std::fixed << std::setprecision(2)
-              << "  " << n_ops << " ops (" << total_ops << " total RAM, "
-              << total_ops - n_ops << " trimmed)"
-              << " in " << num_chunks << " chunks, " << num_instances << " instances"
+              << "  " << n_ops << " ops in " << num_chunks << " chunks, "
+              << num_instances << " instances (last: " << last_inst_size << " ops)"
               << " (" << (omp_get_wtime() - t) * 1e3 << " ms)" << std::endl;
 }
 
@@ -772,7 +763,7 @@ void PairSortGPU::gpu_metadata() {
     // Launch build_metas_kernel on meta_stream
     build_metas_kernel<<<num_active, 256, 0, meta_stream>>>(
         d_fml, d_prefix, d_active_ids, d_active_first, d_active_last,
-        d_result_nops, d_meta_scalars, num_active, num_chunks);
+        d_result_nops, d_meta_scalars, num_active, num_chunks, n_ops);
 
     // Launch addr_offsets kernel on d2h_stream
     compute_addr_offsets_kernel<<<num_active, 1024, 0, d2h_stream>>>(
@@ -824,6 +815,7 @@ void PairSortGPU::cpu_fill() {
         auto& m = metas[idx];
         bool single_addr = (m.first_addr == m.last_addr);
 
+        uint32_t inst_size = std::min(INSTANCE_SIZE, n_ops - m.inst_id * INSTANCE_SIZE);
         uint32_t out_base = m.inst_id * INSTANCE_SIZE;
         uint32_t total_written = 0;
         for (uint32_t chunk_gid = 0; chunk_gid < num_chunks; chunk_gid++) {
@@ -865,9 +857,9 @@ void PairSortGPU::cpu_fill() {
                 out_ops[out_pos] = raw;
                 out_vals[out_pos] = h_vals[chunk_start + j];
                 total_written++;
-                if (total_written >= INSTANCE_SIZE) break;
+                if (total_written >= inst_size) break;
             }
-            if (total_written >= INSTANCE_SIZE) break;
+            if (total_written >= inst_size) break;
         }
     }
 
@@ -899,9 +891,10 @@ void PairSortGPU::verify() {
     for (uint32_t idx = 0; idx < num_active; idx++) {
         auto& m = metas[idx];
         uint32_t inst = m.inst_id;
+        uint32_t inst_size = std::min(INSTANCE_SIZE, n_ops - inst * INSTANCE_SIZE);
         uint32_t start = inst * INSTANCE_SIZE;
 
-        for (uint32_t j = 0; j < INSTANCE_SIZE; j++) {
+        for (uint32_t j = 0; j < inst_size; j++) {
             uint32_t ind = start + j;
             if (out_ops[ind] != ref_ops[ind] || out_vals[ind] != ref_vals[ind]) {
                 std::cout << "MISMATCH at ref position " << ind << " (instance " << inst
@@ -910,7 +903,7 @@ void PairSortGPU::verify() {
                 return;
             }
         }
-        total_verified += INSTANCE_SIZE;
+        total_verified += inst_size;
     }
     std::cout << std::fixed << std::setprecision(2)
               << "  Verify:           " << (omp_get_wtime() - t) * 1e3
