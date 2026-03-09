@@ -12,6 +12,7 @@
 constexpr uint32_t N_ADDR = 1u << 27;
 constexpr uint32_t INSTANCE_SIZE = 1u << 22;
 constexpr uint32_t MAX_INSTANCES = 256;
+constexpr uint32_t MASK_INSTANCES_WORDS = MAX_INSTANCES / 32;
 constexpr uint32_t MAX_OPS = (uint32_t)MAX_INSTANCES * INSTANCE_SIZE;  // 2^30
 constexpr uint32_t N_WORKERS = 16;
 constexpr uint32_t MAX_ACTIVE = (MAX_INSTANCES + N_WORKERS - 1) / N_WORKERS;  // 16
@@ -19,6 +20,18 @@ constexpr uint32_t MAX_CHUNKS = 4096;
 constexpr int N_STREAMS = 4;
 
 // ---------- GPU kernels ----------
+
+__global__ void extract_active_ids_kernel(
+    const uint32_t* d_mask, uint32_t num_instances,
+    uint32_t* d_active_ids, uint32_t* d_num_active)
+{
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < num_instances; i++) {
+        if (d_mask[i / 32] & (1u << (i % 32)))
+            d_active_ids[count++] = i;
+    }
+    *d_num_active = count;
+}
 
 __global__ void histogram_kernel(const uint32_t* ops, uint32_t* hist, uint32_t n) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -401,6 +414,7 @@ class PairSortGPU {
     void *d_temp;
     size_t d_temp_bytes;
     uint32_t *d_active_ids, *d_active_first, *d_active_last;
+    uint32_t *d_active_mask;  // GPU copy of bitmask
     uint32_t *d_fml;
     uint32_t *d_result_nops;
     uint32_t *d_meta_scalars;
@@ -423,7 +437,7 @@ class PairSortGPU {
     uint32_t *out_ops, *out_vals;
     uint32_t *ref_ops, *ref_vals;
     std::vector<uint32_t> h_active_first, h_active_last;
-    std::vector<uint32_t> active;
+    uint32_t active_mask[MASK_INSTANCES_WORDS];
     std::vector<InstanceMeta> metas;
 
     // Runtime state
@@ -464,6 +478,7 @@ PairSortGPU::PairSortGPU()
     cudaMalloc(&d_temp, d_temp_bytes);
 
     cudaMalloc(&d_active_ids, MAX_ACTIVE * sizeof(uint32_t));
+    cudaMalloc(&d_active_mask, MASK_INSTANCES_WORDS * sizeof(uint32_t));
     cudaMalloc(&d_active_first, MAX_ACTIVE * sizeof(uint32_t));
     cudaMalloc(&d_active_last, MAX_ACTIVE * sizeof(uint32_t));
     cudaMalloc(&d_fml, fml_size * sizeof(uint32_t));
@@ -517,20 +532,29 @@ void PairSortGPU::pick_active_instances() {
     std::uniform_int_distribution<uint32_t> worker_dist(0, N_WORKERS - 1);
     uint32_t worker_id = worker_dist(rng);
 
-    active.clear();
+    memset(active_mask, 0, sizeof(active_mask));
+    num_active = 0;
     for (uint32_t i = 0; i < num_instances; i++) {
-        if (i % N_WORKERS == worker_id)
-            active.push_back(i);
+        if (i % N_WORKERS == worker_id) {
+            active_mask[i / 32] |= (1u << (i % 32));
+            num_active++;
+        }
     }
-    num_active = active.size();
 
     std::cout << "  Instances: " << num_instances << ", Worker: " << worker_id
               << ", Active: " << num_active << std::endl;
     std::cout << "  Active IDs:";
-    for (uint32_t id : active) std::cout << " " << id;
+    for (uint32_t i = 0; i < num_instances; i++)
+        if (active_mask[i / 32] & (1u << (i % 32)))
+            std::cout << " " << i;
     std::cout << std::endl;
 
-    cudaMemcpy(d_active_ids, active.data(), num_active * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_active_mask, active_mask, MASK_INSTANCES_WORDS * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    uint32_t* d_num_active_ptr;
+    cudaMalloc(&d_num_active_ptr, sizeof(uint32_t));
+    extract_active_ids_kernel<<<1, 1>>>(d_active_mask, num_instances, d_active_ids, d_num_active_ptr);
+    cudaDeviceSynchronize();
+    cudaFree(d_num_active_ptr);
 }
 
 PairSortGPU::~PairSortGPU() {
@@ -540,6 +564,7 @@ PairSortGPU::~PairSortGPU() {
     cudaFree(d_prefix);
     cudaFree(d_temp);
     cudaFree(d_active_ids);
+    cudaFree(d_active_mask);
     cudaFree(d_active_first);
     cudaFree(d_active_last);
     cudaFree(d_fml);
@@ -715,18 +740,20 @@ void PairSortGPU::gpu_metadata() {
     cudaStreamSynchronize(meta_stream);
     cudaStreamSynchronize(d2h_stream);
 
-    // Populate metas from GPU results
-    for (uint32_t i = 0; i < num_active; i++) {
-        uint32_t* sc = h_meta_scalars + i * 4;
-        metas[i].inst_id = active[i];
-        metas[i].first_addr = h_active_first[i];
-        metas[i].last_addr = h_active_last[i];
-        metas[i].first_addr_chunk = sc[0];
-        metas[i].first_addr_skip = sc[1];
-        metas[i].last_addr_chunk = sc[2];
-        metas[i].last_addr_include = sc[3];
-        metas[i].addr_offsets = h_offsets_buf + h_offset_starts[i];
-        metas[i].nops_per_chunk = h_result_nops + (size_t)i * num_chunks;
+    uint32_t ai = 0;
+    for (uint32_t i = 0; i < num_instances && ai < num_active; i++) {
+        if (!(active_mask[i / 32] & (1u << (i % 32)))) continue;
+        uint32_t* sc = h_meta_scalars + ai * 4;
+        metas[ai].inst_id = i;
+        metas[ai].first_addr = h_active_first[ai];
+        metas[ai].last_addr = h_active_last[ai];
+        metas[ai].first_addr_chunk = sc[0];
+        metas[ai].first_addr_skip = sc[1];
+        metas[ai].last_addr_chunk = sc[2];
+        metas[ai].last_addr_include = sc[3];
+        metas[ai].addr_offsets = h_offsets_buf + h_offset_starts[ai];
+        metas[ai].nops_per_chunk = h_result_nops + (size_t)ai * num_chunks;
+        ai++;
     }
 
     std::cout << std::fixed << std::setprecision(2)
