@@ -1,0 +1,5 @@
+0. unified memory
+1. valors random en els 3 intervals, ignorar els que no siguin de ram
+2. instances dels 3 tipus (com enllacen amb pading)
+3. truncar addreces un cop acabat histograma...
+4. compactar missatges
