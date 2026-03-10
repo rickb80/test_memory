@@ -9,35 +9,41 @@
 #include <vector>
 #include <cub/device/device_scan.cuh>
 
-// ---------- Constants ----------
-constexpr uint32_t N_ADDR_ROM   = 1u << 24;  // 16M
-constexpr uint32_t N_ADDR_INPUT = 1u << 24;  // 16M
-constexpr uint32_t N_ADDR_RAM   = 1u << 26;  // 64M
+// =====================================================================
+// Constants
+// =====================================================================
+
+constexpr uint32_t N_ADDR_ROM   = 1u << 24;   // 16M
+constexpr uint32_t N_ADDR_INPUT = 1u << 24;   // 16M
+constexpr uint32_t N_ADDR_RAM   = 1u << 26;   // 64M
 constexpr uint32_t N_ADDR = N_ADDR_ROM + N_ADDR_INPUT + N_ADDR_RAM;  // 96M
 
-constexpr uint32_t INSTANCE_SIZE = 1u << 22;
+constexpr uint32_t INSTANCE_SIZE = 1u << 22;  // 4M entries per instance
 
 constexpr uint32_t MAX_INST_ROM   = 32;
 constexpr uint32_t MAX_INST_INPUT = 32;
 constexpr uint32_t MAX_INST_RAM   = 256;
-constexpr uint32_t MAX_INSTANCES = MAX_INST_ROM + MAX_INST_INPUT + MAX_INST_RAM;  // 320
-constexpr uint32_t MASK_WORDS = (MAX_INSTANCES + 31) / 32;  // 10
+constexpr uint32_t MAX_INSTANCES  = MAX_INST_ROM + MAX_INST_INPUT + MAX_INST_RAM;
+constexpr uint32_t MAX_INST[3]    = {MAX_INST_ROM, MAX_INST_INPUT, MAX_INST_RAM};
+constexpr uint32_t MASK_WORDS     = (MAX_INSTANCES + 31) / 32;
 
-constexpr uint32_t MAX_OPS = (uint32_t)MAX_INSTANCES * INSTANCE_SIZE;
-constexpr uint32_t N_WORKERS = 16;
-constexpr uint32_t MAX_ACTIVE = (MAX_INSTANCES + N_WORKERS - 1) / N_WORKERS;  // 20
+constexpr uint32_t MAX_OPS    = (uint32_t)MAX_INSTANCES * INSTANCE_SIZE;
+constexpr uint32_t N_WORKERS  = 16;
+constexpr uint32_t MAX_ACTIVE = (MAX_INSTANCES + N_WORKERS - 1) / N_WORKERS;
 constexpr uint32_t MAX_CHUNKS = 4096;
-constexpr int N_STREAMS = 4;
+constexpr int      N_STREAMS  = 4;
 
-// Region type enum
+// Region identifiers
 constexpr uint8_t REGION_ROM   = 0;
 constexpr uint8_t REGION_INPUT = 1;
 constexpr uint8_t REGION_RAM   = 2;
+constexpr const char* REGION_NAME[3] = {"ROM", "INPUT", "RAM"};
 
-// Compact address region boundaries (host-side)
+// Compact address space layout: [ROM: 0..16M) [INPUT: 16M..32M) [RAM: 32M..96M)
 constexpr uint32_t REGION_ADDR_START[3] = {0, N_ADDR_ROM, N_ADDR_ROM + N_ADDR_INPUT};
-constexpr uint32_t REGION_N_ADDR[3] = {N_ADDR_ROM, N_ADDR_INPUT, N_ADDR_RAM};
+constexpr uint32_t REGION_N_ADDR[3]     = {N_ADDR_ROM, N_ADDR_INPUT, N_ADDR_RAM};
 
+// Maps raw hardware address to compact address space
 inline uint32_t compact_addr(uint32_t raw) {
     if (raw >= 0xA0000000u)
         return ((raw - 0xA0000000u) >> 3) + N_ADDR_ROM + N_ADDR_INPUT;
@@ -46,13 +52,15 @@ inline uint32_t compact_addr(uint32_t raw) {
     return (raw - 0x80000000u) >> 3;
 }
 
-// ---------- GPU kernels ----------
+// =====================================================================
+// GPU Kernels
+// =====================================================================
 
-// Shift raw addresses to compact space and histogram in one pass
-__global__ void shift_and_histogram_kernel(uint32_t* ops, uint32_t* hist, uint32_t n) {
+// Converts raw addresses to compact space in-place and builds histogram
+__global__ void shift_and_histogram_kernel(uint32_t* ops, uint32_t* hist, uint32_t num_ops) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t stride = gridDim.x * blockDim.x;
-    for (; i < n; i += stride) {
+    for (; i < num_ops; i += stride) {
         uint32_t addr = ops[i];
         uint32_t compact;
         if (addr >= 0xA0000000u)
@@ -66,90 +74,86 @@ __global__ void shift_and_histogram_kernel(uint32_t* ops, uint32_t* hist, uint32
     }
 }
 
+// Finds first/last compact addresses for each active instance via binary search on prefix sums.
+// Also computes offset_starts (prefix sum of per-instance address counts).
 __global__ void instance_boundaries_kernel(
     const uint32_t* prefix,
-    uint32_t prefix_base_addr,
-    uint32_t n_addr_region,
-    uint32_t n_ops_region,
-    uint32_t sorted_start,
-    const uint32_t* d_active_ids,
-    uint32_t* d_active_first,
-    uint32_t* d_active_last,
-    uint32_t* d_offset_starts,
+    uint32_t prefix_base_addr, uint32_t num_addr_region,
+    uint32_t num_ops_region, uint32_t region_start,
+    const uint32_t* active_ids,
+    uint32_t* active_first, uint32_t* active_last,
+    uint32_t* offset_starts,
     uint32_t num_active)
 {
-    uint32_t ai = threadIdx.x;
-    if (ai >= num_active) return;
+    uint32_t idx = threadIdx.x;
+    if (idx >= num_active) return;
 
-    uint32_t local_inst = d_active_ids[ai];
-    uint32_t base_pos = sorted_start + local_inst * INSTANCE_SIZE;
-    uint32_t isize = min(INSTANCE_SIZE, n_ops_region - local_inst * INSTANCE_SIZE);
-    uint32_t inst_start = (local_inst == 0) ? base_pos : base_pos - 1;
-    uint32_t inst_end_val = base_pos + isize;
+    uint32_t local_inst = active_ids[idx];
+    uint32_t base_pos   = region_start + local_inst * INSTANCE_SIZE;
+    uint32_t inst_size   = min(INSTANCE_SIZE, num_ops_region - local_inst * INSTANCE_SIZE);
+    uint32_t inst_start  = (local_inst == 0) ? base_pos : base_pos - 1;
+    uint32_t inst_end    = base_pos + inst_size;
 
-    // Find largest address <= inst_start
-    uint32_t lo = prefix_base_addr, hi = prefix_base_addr + n_addr_region;
+    // Binary search: largest address with prefix[addr] <= inst_start
+    uint32_t lo = prefix_base_addr, hi = prefix_base_addr + num_addr_region;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo + 1) / 2;
         if (prefix[mid] <= inst_start) lo = mid;
         else hi = mid - 1;
     }
-    d_active_first[ai] = lo;
+    active_first[idx] = lo;
 
-    // Find largest address <= inst_end - 1
-    lo = d_active_first[ai]; hi = prefix_base_addr + n_addr_region;
+    // Binary search: largest address with prefix[addr] < inst_end
+    lo = active_first[idx];
+    hi = prefix_base_addr + num_addr_region;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo + 1) / 2;
-        if (prefix[mid] < inst_end_val) lo = mid;
+        if (prefix[mid] < inst_end) lo = mid;
         else hi = mid - 1;
     }
-    d_active_last[ai] = lo;
+    active_last[idx] = lo;
 
-    // Compute offset_starts
+    // Thread 0 computes offset_starts (serial prefix sum over address counts)
     __syncthreads();
-    if (ai == 0) {
+    if (idx == 0) {
         uint32_t offset = 0;
         for (uint32_t i = 0; i < num_active; i++) {
-            d_offset_starts[i] = offset;
-            offset += d_active_last[i] - d_active_first[i] + 1;
+            offset_starts[i] = offset;
+            offset += active_last[i] - active_first[i] + 1;
         }
     }
 }
 
-// Counts first/middle/last entries for each active instance within each chunk
+// Counts first/middle/last address hits per (instance, chunk) pair.
+// Output: d_fml[instance][chunk][3] where [0]=first, [1]=middle, [2]=last.
 __global__ void chunk_fml_count_kernel(
     const uint32_t* ops,
-    const uint32_t* d_active_first,
-    const uint32_t* d_active_last,
-    const uint32_t* d_chunk_offsets,
-    uint32_t* d_fml,  // [num_active][num_chunks][3] = first/middle/last (instance-major)
-    uint32_t num_active,
-    uint32_t num_chunks,
-    uint32_t n_ops)
+    const uint32_t* active_first, const uint32_t* active_last,
+    const uint32_t* chunk_offsets,
+    uint32_t* d_fml,
+    uint32_t num_active, uint32_t num_chunks, uint32_t num_ops)
 {
     __shared__ uint32_t s_first[MAX_ACTIVE];
     __shared__ uint32_t s_last[MAX_ACTIVE];
     if (threadIdx.x < num_active) {
-        s_first[threadIdx.x] = d_active_first[threadIdx.x];
-        s_last[threadIdx.x] = d_active_last[threadIdx.x];
+        s_first[threadIdx.x] = active_first[threadIdx.x];
+        s_last[threadIdx.x]  = active_last[threadIdx.x];
     }
     __syncthreads();
 
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t stride = gridDim.x * blockDim.x;
     uint32_t lane = threadIdx.x & 31;
-
     uint32_t chunk_id = 0;
 
-    for (; i < n_ops; i += stride) {
-        while (chunk_id + 1 < num_chunks && i >= d_chunk_offsets[chunk_id + 1])
+    for (; i < num_ops; i += stride) {
+        while (chunk_id + 1 < num_chunks && i >= chunk_offsets[chunk_id + 1])
             chunk_id++;
 
         uint32_t addr = ops[i];
 
-        // Check if entire warp is in same chunk
         uint32_t warp_chunk_first = __shfl_sync(0xFFFFFFFF, chunk_id, 0);
-        uint32_t warp_chunk_last = __shfl_sync(0xFFFFFFFF, chunk_id, 31);
+        uint32_t warp_chunk_last  = __shfl_sync(0xFFFFFFFF, chunk_id, 31);
         bool same_chunk = (warp_chunk_first == warp_chunk_last);
 
         for (uint32_t ai = 0; ai < num_active; ai++) {
@@ -162,20 +166,19 @@ __global__ void chunk_fml_count_kernel(
 
             if (!__any_sync(0xFFFFFFFF, in_range)) continue;
 
+            // Categorize: 0=first, 1=middle, 2=last, 3=out-of-range
             uint32_t cat = 3;
             if (in_range) {
-                if (addr == fa) cat = 0;
+                if (addr == fa)      cat = 0;
                 else if (addr == la) cat = 2;
-                else cat = 1;
+                else                 cat = 1;
             }
 
             if (same_chunk) {
-                // Warp reduction
                 for (uint32_t c = 0; c < 3; c++) {
                     unsigned mask = __ballot_sync(0xFFFFFFFF, cat == c);
-                    if (mask && lane == 0) {
+                    if (mask && lane == 0)
                         atomicAdd(&d_fml[(ai * num_chunks + chunk_id) * 3 + c], __popc(mask));
-                    }
                 }
             } else if (in_range) {
                 atomicAdd(&d_fml[(ai * num_chunks + chunk_id) * 3 + cat], 1);
@@ -184,50 +187,45 @@ __global__ void chunk_fml_count_kernel(
     }
 }
 
-// Build metas on GPU: one block per active instance, 256 threads per block
+// Builds per-instance metadata on GPU (one block per instance, 256 threads).
+// Determines first/last chunk boundaries and per-chunk op counts.
 __global__ void build_metas_kernel(
-    const uint32_t* d_fml,           // [num_active][num_chunks][3], instance-major
-    const uint32_t* d_prefix,        // global prefix sums [0..N_ADDR]
-    uint32_t n_ops_region,
-    uint32_t sorted_start,
-    const uint32_t* d_active_ids,
-    const uint32_t* d_active_first,
-    const uint32_t* d_active_last,
-    uint32_t* d_result_nops,         // output + scratch: [num_active][num_chunks]
-    uint32_t* d_meta_scalars,        // output: [num_active][4]
-    uint32_t num_active,
-    uint32_t num_chunks)
+    const uint32_t* d_fml,
+    const uint32_t* prefix,
+    uint32_t num_ops_region, uint32_t region_start,
+    const uint32_t* active_ids,
+    const uint32_t* active_first, const uint32_t* active_last,
+    uint32_t* result_nops,
+    uint32_t* meta_scalars,
+    uint32_t num_active, uint32_t num_chunks)
 {
     const uint32_t ai = blockIdx.x;
     if (ai >= num_active) return;
     const uint32_t tid = threadIdx.x;
     const uint32_t nthreads = blockDim.x;
 
-    // Shared memory for block communication
     __shared__ uint32_t s_total_compacted;
     __shared__ uint32_t s_first_addr_total_skip;
     __shared__ uint32_t s_last_addr_total_include;
-    __shared__ bool s_single_addr;
+    __shared__ bool     s_single_addr;
     __shared__ uint32_t s_fa_chunk, s_fa_skip, s_la_chunk, s_la_include;
     __shared__ uint32_t s_scan[256];
 
     const uint32_t* fml_base = d_fml + (size_t)ai * num_chunks * 3;
-    uint32_t* scratch = d_result_nops + (size_t)ai * num_chunks;
+    uint32_t* scratch = result_nops + (size_t)ai * num_chunks;
 
-    // ---- Phase 1: find non-empty chunks
+    // Phase 1: Compact non-empty chunk IDs
     uint32_t chunks_per_thread = (num_chunks + nthreads - 1) / nthreads;
     uint32_t c_start = tid * chunks_per_thread;
-    uint32_t c_end = min(c_start + chunks_per_thread, num_chunks);
+    uint32_t c_end   = min(c_start + chunks_per_thread, num_chunks);
 
-    // Pass 1: count non-empty chunks per thread
     uint32_t my_count = 0;
     for (uint32_t c = c_start; c < c_end; c++) {
-        uint32_t idx = c * 3;
-        if (fml_base[idx] + fml_base[idx + 1] + fml_base[idx + 2] > 0)
+        uint32_t base = c * 3;
+        if (fml_base[base] + fml_base[base + 1] + fml_base[base + 2] > 0)
             my_count++;
     }
 
-    // Block-level exclusive prefix sum of my_count
     s_scan[tid] = my_count;
     __syncthreads();
     if (tid == 0) {
@@ -241,52 +239,49 @@ __global__ void build_metas_kernel(
     }
     __syncthreads();
 
-    uint32_t my_offset = s_scan[tid];
-
-    // Pass 2: write compacted chunk IDs into scratch
-    uint32_t write_pos = my_offset;
+    uint32_t write_pos = s_scan[tid];
     for (uint32_t c = c_start; c < c_end; c++) {
-        uint32_t idx = c * 3;
-        if (fml_base[idx] + fml_base[idx + 1] + fml_base[idx + 2] > 0)
+        uint32_t base = c * 3;
+        if (fml_base[base] + fml_base[base + 1] + fml_base[base + 2] > 0)
             scratch[write_pos++] = c;
     }
     __syncthreads();
 
     uint32_t nc = s_total_compacted;
 
-    // ---- Phase 2: s_first_addr_total_skip and s_last_addr_total_include
+    // Phase 2: Compute skip/include counts for first/last address
     if (tid == 0) {
-        uint32_t fa = d_active_first[ai];
-        uint32_t la = d_active_last[ai];
-        bool single_addr = (fa == la);
-        uint32_t n_addrs_inst = la - fa + 1;
+        uint32_t fa = active_first[ai];
+        uint32_t la = active_last[ai];
+        bool single_addr   = (fa == la);
+        uint32_t num_addrs = la - fa + 1;
 
         s_single_addr = single_addr;
 
-        uint32_t local_inst = d_active_ids[ai];
-        uint32_t base_pos = sorted_start + local_inst * INSTANCE_SIZE;
-        uint32_t isize = min(INSTANCE_SIZE, n_ops_region - local_inst * INSTANCE_SIZE);
-        uint32_t halo_base = (local_inst == 0) ? base_pos : base_pos - 1;
-        s_first_addr_total_skip = halo_base - d_prefix[fa];
+        uint32_t local_inst = active_ids[ai];
+        uint32_t base_pos   = region_start + local_inst * INSTANCE_SIZE;
+        uint32_t inst_size  = min(INSTANCE_SIZE, num_ops_region - local_inst * INSTANCE_SIZE);
+        uint32_t halo_base  = (local_inst == 0) ? base_pos : base_pos - 1;
+        s_first_addr_total_skip = halo_base - prefix[fa];
 
         if (!single_addr) {
-            uint32_t filled_before_last = d_prefix[fa + n_addrs_inst - 1] - base_pos;
-            s_last_addr_total_include = isize - filled_before_last;
+            uint32_t filled_before_last = prefix[fa + num_addrs - 1] - base_pos;
+            s_last_addr_total_include = inst_size - filled_before_last;
         } else {
-            s_last_addr_total_include = isize;
-            if (halo_base != base_pos) s_last_addr_total_include++;  // +1 for halo row
+            s_last_addr_total_include = inst_size;
+            if (halo_base != base_pos) s_last_addr_total_include++;
         }
     }
     __syncthreads();
 
-    uint32_t first_addr_total_skip = s_first_addr_total_skip;
-    uint32_t last_addr_total_include = s_last_addr_total_include;
+    uint32_t first_addr_total_skip    = s_first_addr_total_skip;
+    uint32_t last_addr_total_include  = s_last_addr_total_include;
     bool single_addr = s_single_addr;
 
-    // ---- Phase 3: Find fa_chunk/fa_skip
+    // Phase 3: Find first-address chunk and skip count
     uint32_t nc_per_thread = (nc + nthreads - 1) / nthreads;
     uint32_t ci_start = tid * nc_per_thread;
-    uint32_t ci_end = min(ci_start + nc_per_thread, nc);
+    uint32_t ci_end   = min(ci_start + nc_per_thread, nc);
 
     uint32_t my_count_first = 0;
     for (uint32_t ci = ci_start; ci < ci_end; ci++)
@@ -295,19 +290,18 @@ __global__ void build_metas_kernel(
     s_scan[tid] = my_count_first;
     __syncthreads();
 
-    // Thread 0 does the prefix-sum search across thread totals
     if (tid == 0) {
         uint32_t cum = 0;
         for (uint32_t t = 0; t < nthreads; t++) {
             if (cum + s_scan[t] > first_addr_total_skip) {
                 uint32_t t_start = t * nc_per_thread;
-                uint32_t t_end = min(t_start + nc_per_thread, nc);
+                uint32_t t_end   = min(t_start + nc_per_thread, nc);
                 uint32_t local_cum = cum;
                 for (uint32_t ci = t_start; ci < t_end; ci++) {
                     uint32_t cf = fml_base[scratch[ci] * 3 + 0];
                     if (local_cum + cf > first_addr_total_skip) {
                         s_fa_chunk = scratch[ci];
-                        s_fa_skip = first_addr_total_skip - local_cum;
+                        s_fa_skip  = first_addr_total_skip - local_cum;
                         break;
                     }
                     local_cum += cf;
@@ -319,7 +313,7 @@ __global__ void build_metas_kernel(
     }
     __syncthreads();
 
-    // ---- Phase 4: Find la_chunk/la_include
+    // Phase 4: Find last-address chunk and include count
     uint32_t la_cat = single_addr ? 0 : 2;
     uint32_t la_threshold = single_addr
         ? (first_addr_total_skip + last_addr_total_include)
@@ -337,12 +331,12 @@ __global__ void build_metas_kernel(
         for (uint32_t t = 0; t < nthreads; t++) {
             if (cum + s_scan[t] >= la_threshold) {
                 uint32_t t_start = t * nc_per_thread;
-                uint32_t t_end = min(t_start + nc_per_thread, nc);
+                uint32_t t_end   = min(t_start + nc_per_thread, nc);
                 uint32_t local_cum = cum;
                 for (uint32_t ci = t_start; ci < t_end; ci++) {
                     uint32_t cv = fml_base[scratch[ci] * 3 + la_cat];
                     if (local_cum + cv >= la_threshold) {
-                        s_la_chunk = scratch[ci];
+                        s_la_chunk   = scratch[ci];
                         s_la_include = la_threshold - local_cum;
                         break;
                     }
@@ -355,23 +349,22 @@ __global__ void build_metas_kernel(
     }
     __syncthreads();
 
-    uint32_t fa_chunk = s_fa_chunk;
-    uint32_t fa_skip = s_fa_skip;
-    uint32_t la_chunk = s_la_chunk;
+    uint32_t fa_chunk   = s_fa_chunk;
+    uint32_t fa_skip    = s_fa_skip;
+    uint32_t la_chunk   = s_la_chunk;
     uint32_t la_include = s_la_include;
 
-    // ---- Phase 5: Chunk elimination (sparse write)
-    // re-zero d_result_nops used previously as scratch
-    uint32_t *results_nops = d_result_nops + (size_t)ai * num_chunks;
+    // Phase 5: Write per-chunk op counts (chunk elimination)
+    uint32_t* out_nops = result_nops + (size_t)ai * num_chunks;
     for (uint32_t c = tid; c < num_chunks; c += nthreads)
-        results_nops[c] = 0;
+        out_nops[c] = 0;
     __syncthreads();
 
     for (uint32_t c = c_start; c < c_end; c++) {
-        uint32_t idx = c * 3;
-        uint32_t cf = fml_base[idx + 0];
-        uint32_t cm = fml_base[idx + 1];
-        uint32_t cl = fml_base[idx + 2];
+        uint32_t base = c * 3;
+        uint32_t cf = fml_base[base + 0];
+        uint32_t cm = fml_base[base + 1];
+        uint32_t cl = fml_base[base + 2];
         if (cf + cm + cl == 0) continue;
 
         bool needed = (cm > 0);
@@ -385,12 +378,12 @@ __global__ void build_metas_kernel(
         if (cl > 0 && c <= la_chunk)
             needed = true;
         if (needed)
-            results_nops[c] = cf + cm + cl;
+            out_nops[c] = cf + cm + cl;
     }
 
-    // ---- Phase 6: Write scalar results
+    // Phase 6: Write scalar results
     if (tid == 0) {
-        uint32_t* out = d_meta_scalars + ai * 4;
+        uint32_t* out = meta_scalars + ai * 4;
         out[0] = fa_chunk;
         out[1] = fa_skip;
         out[2] = la_chunk;
@@ -398,147 +391,164 @@ __global__ void build_metas_kernel(
     }
 }
 
+// Computes per-address offsets within each instance for scatter positioning
 __global__ void compute_addr_offsets_kernel(
-    const uint32_t* d_prefix,
-    uint32_t n_ops_region,
-    uint32_t sorted_start,
-    const uint32_t* d_active_ids,
-    const uint32_t* d_active_first,
-    const uint32_t* d_active_last,
-    uint32_t* d_addr_offsets,
-    const uint32_t* d_offset_starts,
+    const uint32_t* prefix,
+    uint32_t num_ops_region, uint32_t region_start,
+    const uint32_t* active_ids,
+    const uint32_t* active_first, const uint32_t* active_last,
+    uint32_t* addr_offsets, const uint32_t* offset_starts,
     uint32_t num_active)
 {
     uint32_t ai = blockIdx.x;
     if (ai >= num_active) return;
 
-    uint32_t fa = d_active_first[ai];
-    uint32_t la = d_active_last[ai];
-    uint32_t n_addrs_inst = la - fa + 1;
+    uint32_t fa = active_first[ai];
+    uint32_t la = active_last[ai];
+    uint32_t num_addrs = la - fa + 1;
 
-    uint32_t local_inst = d_active_ids[ai];
-    uint32_t base_pos = sorted_start + local_inst * INSTANCE_SIZE;
-    uint32_t halo_base = (local_inst == 0) ? base_pos : base_pos - 1;
+    uint32_t local_inst = active_ids[ai];
+    uint32_t base_pos   = region_start + local_inst * INSTANCE_SIZE;
+    uint32_t halo_base  = (local_inst == 0) ? base_pos : base_pos - 1;
 
-    uint32_t* out = d_addr_offsets + d_offset_starts[ai];
-
+    uint32_t* out = addr_offsets + offset_starts[ai];
     uint32_t tid = threadIdx.x;
     uint32_t stride = blockDim.x;
 
     if (tid == 0)
         out[0] = (halo_base == base_pos) ? 1 : 0;
 
-    for (uint32_t j = tid + 1; j < n_addrs_inst; j += stride)
-        out[j] = d_prefix[fa + j] - (base_pos - 1);
+    for (uint32_t j = tid + 1; j < num_addrs; j += stride)
+        out[j] = prefix[fa + j] - (base_pos - 1);
 }
 
+// =====================================================================
+// InstanceMeta
+// =====================================================================
+
 struct InstanceMeta {
-    uint32_t inst_id;           // LOCAL instance ID within region
-    uint8_t  type;              // REGION_ROM, REGION_INPUT, or REGION_RAM
-    uint32_t first_addr, last_addr;
-    const uint32_t* nops_per_chunk;       // points into pinned h_result_nops (not owned)
-    uint32_t* addr_offsets;               // points into pinned buffer (not owned)
-
-    uint32_t first_addr_chunk;
-    uint32_t first_addr_skip;
-
-    uint32_t last_addr_chunk;
-    uint32_t last_addr_include;
+    uint32_t inst_id;            // local instance ID within region
+    uint8_t  type;               // REGION_ROM / REGION_INPUT / REGION_RAM
+    uint32_t first_addr;         // first compact address covered
+    uint32_t last_addr;          // last compact address covered
+    const uint32_t* nops_per_chunk;  // per-chunk op counts (pinned, not owned)
+    uint32_t* addr_offsets;          // per-address scatter offsets (pinned, not owned)
+    uint32_t first_addr_chunk;   // chunk where first-address data begins
+    uint32_t first_addr_skip;    // entries to skip in first_addr_chunk
+    uint32_t last_addr_chunk;    // chunk where last-address data ends
+    uint32_t last_addr_include;  // entries to include in last_addr_chunk
 };
 
-// ---------- PairSortGPU ----------
+// =====================================================================
+// PairSortGPU
+// =====================================================================
 
 class PairSortGPU {
-    // GPU memory
-    uint32_t *d_ops, *d_hist, *d_prefix;
-    void *d_temp; // for prefix evaluation
-    size_t d_temp_bytes;
-    uint32_t *d_active_ids, *d_active_first, *d_active_last;
-    uint32_t *d_fml;
-    uint32_t *d_result_nops;
-    uint32_t *d_meta_scalars;
-    uint32_t *d_addr_offsets, *d_offset_starts;
-    uint32_t *d_chunk_offsets;
+    // --- GPU memory ---
+    uint32_t* d_ops;
+    uint32_t* d_hist;
+    uint32_t* d_prefix;
+    void*     d_temp;
+    size_t    d_temp_bytes;
+    uint32_t* d_active_ids;
+    uint32_t* d_active_first;
+    uint32_t* d_active_last;
+    uint32_t* d_fml;
+    uint32_t* d_result_nops;
+    uint32_t* d_meta_scalars;
+    uint32_t* d_addr_offsets;
+    uint32_t* d_offset_starts;
+    uint32_t* d_chunk_offsets;
 
+    // --- Streams ---
     cudaStream_t streams[N_STREAMS];
     cudaStream_t d2h_stream;
     cudaStream_t meta_stream;
 
-    // Host pinned
-    uint32_t *h_ops;
-    uint32_t *h_offsets_buf;
-    size_t h_offsets_buf_size;
-    uint32_t *h_result_nops;
-    uint32_t *h_meta_scalars;
+    // --- Host pinned memory ---
+    uint32_t* h_ops;
+    uint32_t* h_offsets_buf;
+    size_t    h_offsets_buf_size;
+    uint32_t* h_result_nops;
+    uint32_t* h_meta_scalars;
 
-    // Host
-    uint32_t *h_vals;
-    // Per-region output arrays
-    uint32_t *out_ops_rom, *out_vals_rom;
-    uint32_t *out_ops_input, *out_vals_input;
-    uint32_t *out_ops_ram, *out_vals_ram;
-    
-    // Per-region reference arrays
-    uint32_t *ref_ops_rom, *ref_vals_rom;
-    uint32_t *ref_ops_input, *ref_vals_input;
-    uint32_t *ref_ops_ram, *ref_vals_ram;
-    std::vector<uint32_t> h_active_first, h_active_last;
+    // --- Host memory ---
+    uint32_t* h_vals;
+
+    // Per-region output arrays (GPU result)
+    uint32_t* out_ops_rom;    uint32_t* out_vals_rom;
+    uint32_t* out_ops_input;  uint32_t* out_vals_input;
+    uint32_t* out_ops_ram;    uint32_t* out_vals_ram;
+
+    // Per-region reference arrays (CPU verification)
+    uint32_t* ref_ops_rom;    uint32_t* ref_vals_rom;
+    uint32_t* ref_ops_input;  uint32_t* ref_vals_input;
+    uint32_t* ref_ops_ram;    uint32_t* ref_vals_ram;
+
+    // --- Active instance tracking ---
     uint32_t active_mask[MASK_WORDS];
-    uint32_t h_active_lids[MAX_ACTIVE];
+    uint32_t h_active_local_ids[MAX_ACTIVE];  // packed local IDs: [ROM...][INPUT...][RAM...]
+    std::vector<uint32_t> h_active_first;
+    std::vector<uint32_t> h_active_last;
     std::vector<InstanceMeta> metas;
 
-    // Runtime state
-    uint32_t n_ops;
+    // --- Runtime state ---
+    uint32_t num_ops;
     uint32_t num_chunks;
     uint32_t num_instances;
     uint32_t num_active;
     std::vector<uint32_t> chunk_offsets;
 
-    // Per-region instance counts and offsets
-    uint32_t num_inst[3];             // {rom, input, ram} instance counts
-    uint32_t na_per[3];               // {rom, input, ram} active instance counts
-    uint32_t active_offset[3];        // offsets into packed active arrays per region
-    uint32_t region_ops_start[3];     // sorted position where each region starts
-    uint32_t region_n_ops[3];         // total ops per region
+    // --- Per-region state ---
+    uint32_t num_inst[3];          // instance count per region
+    uint32_t num_active_per[3];    // active instance count per region
+    uint32_t active_offset[3];     // offset into packed active arrays per region
+    uint32_t region_ops_start[3];  // sorted position where each region starts
+    uint32_t region_n_ops[3];      // total ops per region
 
 public:
     PairSortGPU();
     ~PairSortGPU();
 
-    void create_active_mask();
-    void pick_active_instances();
     void generate(uint32_t block_number);
     void gpu_metadata();
     void cpu_fill();
     void reference_sort();
     void verify();
+
+private:
+    void create_active_mask();
+    void pick_active_instances();
 };
+
+// =====================================================================
+// PairSortGPU Implementation
+// =====================================================================
 
 PairSortGPU::PairSortGPU()
     : h_active_first(MAX_ACTIVE), h_active_last(MAX_ACTIVE), metas(MAX_ACTIVE),
-      n_ops(0), num_chunks(0), num_instances(0), num_active(0),
-      num_inst{}, na_per{}, active_offset{}, region_ops_start{}, region_n_ops{}
+      num_ops(0), num_chunks(0), num_instances(0), num_active(0),
+      num_inst{}, num_active_per{}, active_offset{}, region_ops_start{}, region_n_ops{}
 {
-
     // GPU allocations
-    cudaMalloc(&d_ops, (size_t)MAX_OPS * sizeof(uint32_t));
-    cudaMalloc(&d_hist, (size_t)N_ADDR * sizeof(uint32_t));
-    cudaMalloc(&d_prefix, (size_t)(N_ADDR + 1) * sizeof(uint32_t));
+    cudaMalloc(&d_ops,           (size_t)MAX_OPS * sizeof(uint32_t));
+    cudaMalloc(&d_hist,          (size_t)N_ADDR * sizeof(uint32_t));
+    cudaMalloc(&d_prefix,        (size_t)(N_ADDR + 1) * sizeof(uint32_t));
 
     d_temp = nullptr;
     d_temp_bytes = 0;
     cub::DeviceScan::ExclusiveSum(d_temp, d_temp_bytes, d_hist, d_prefix, N_ADDR);
     cudaMalloc(&d_temp, d_temp_bytes);
 
-    cudaMalloc(&d_active_ids, MAX_ACTIVE * sizeof(uint32_t));
-    cudaMalloc(&d_active_first, MAX_ACTIVE * sizeof(uint32_t));
-    cudaMalloc(&d_active_last, MAX_ACTIVE * sizeof(uint32_t));
-    cudaMalloc(&d_fml, (size_t)MAX_ACTIVE * MAX_CHUNKS * 3 * sizeof(uint32_t));
-    cudaMalloc(&d_result_nops, (size_t)MAX_ACTIVE * MAX_CHUNKS * sizeof(uint32_t));
-    cudaMalloc(&d_meta_scalars, (size_t)MAX_ACTIVE * 4 * sizeof(uint32_t));
-    cudaMalloc(&d_addr_offsets, (size_t)MAX_ACTIVE * (INSTANCE_SIZE + 1) * sizeof(uint32_t));
-    cudaMalloc(&d_offset_starts, (size_t)MAX_ACTIVE * sizeof(uint32_t));
-    cudaMalloc(&d_chunk_offsets, (size_t)(MAX_CHUNKS + 1) * sizeof(uint32_t));
+    cudaMalloc(&d_active_ids,    MAX_ACTIVE * sizeof(uint32_t));
+    cudaMalloc(&d_active_first,  MAX_ACTIVE * sizeof(uint32_t));
+    cudaMalloc(&d_active_last,   MAX_ACTIVE * sizeof(uint32_t));
+    cudaMalloc(&d_fml,           (size_t)MAX_ACTIVE * MAX_CHUNKS * 3 * sizeof(uint32_t));
+    cudaMalloc(&d_result_nops,   (size_t)MAX_ACTIVE * MAX_CHUNKS * sizeof(uint32_t));
+    cudaMalloc(&d_meta_scalars,  (size_t)MAX_ACTIVE * 4 * sizeof(uint32_t));
+    cudaMalloc(&d_addr_offsets,  (size_t)MAX_ACTIVE * (INSTANCE_SIZE + 1) * sizeof(uint32_t));
+    cudaMalloc(&d_offset_starts, MAX_ACTIVE * sizeof(uint32_t));
+    cudaMalloc(&d_chunk_offsets, (MAX_CHUNKS + 1) * sizeof(uint32_t));
 
     // Streams
     for (int s = 0; s < N_STREAMS; s++)
@@ -547,24 +557,27 @@ PairSortGPU::PairSortGPU()
     cudaStreamCreate(&meta_stream);
 
     // Host pinned
-    cudaMallocHost(&h_ops, (size_t)MAX_OPS * sizeof(uint32_t));
+    cudaMallocHost(&h_ops,          (size_t)MAX_OPS * sizeof(uint32_t));
     h_offsets_buf_size = 1ull << 28;  // 256 MB
-    cudaMallocHost(&h_offsets_buf, h_offsets_buf_size);
-    cudaMallocHost(&h_result_nops, (size_t)MAX_ACTIVE * MAX_CHUNKS * sizeof(uint32_t));
-    cudaMallocHost(&h_meta_scalars, (size_t)MAX_ACTIVE * 4 * sizeof(uint32_t));
+    cudaMallocHost(&h_offsets_buf,   h_offsets_buf_size);
+    cudaMallocHost(&h_result_nops,   (size_t)MAX_ACTIVE * MAX_CHUNKS * sizeof(uint32_t));
+    cudaMallocHost(&h_meta_scalars,  (size_t)MAX_ACTIVE * 4 * sizeof(uint32_t));
 
-    // Host — per-region output arrays
+    // Host — per-region output/reference arrays
     h_vals = new uint32_t[MAX_OPS];
     size_t rom_sz   = (size_t)MAX_INST_ROM   * INSTANCE_SIZE;
     size_t input_sz = (size_t)MAX_INST_INPUT * INSTANCE_SIZE;
     size_t ram_sz   = (size_t)MAX_INST_RAM   * INSTANCE_SIZE;
+
     out_ops_rom   = new uint32_t[rom_sz]();    out_vals_rom   = new uint32_t[rom_sz]();
     out_ops_input = new uint32_t[input_sz]();  out_vals_input = new uint32_t[input_sz]();
     out_ops_ram   = new uint32_t[ram_sz]();    out_vals_ram   = new uint32_t[ram_sz]();
+
     ref_ops_rom   = new uint32_t[rom_sz];      ref_vals_rom   = new uint32_t[rom_sz];
     ref_ops_input = new uint32_t[input_sz];    ref_vals_input = new uint32_t[input_sz];
     ref_ops_ram   = new uint32_t[ram_sz];      ref_vals_ram   = new uint32_t[ram_sz];
 
+    // Print memory usage
     size_t gpu_bytes = ((size_t)MAX_OPS + N_ADDR + N_ADDR + 1) * sizeof(uint32_t)
                      + d_temp_bytes
                      + (size_t)MAX_ACTIVE * 3 * sizeof(uint32_t)
@@ -580,52 +593,11 @@ PairSortGPU::PairSortGPU()
                         + (size_t)MAX_ACTIVE * 4 * sizeof(uint32_t);
     std::cout << "=== Setup ===" << std::endl
               << std::fixed << std::setprecision(1)
-              << "  GPU:         " << gpu_bytes / (double)(1<<30) << " GB" << std::endl
-              << "  Host pinned: " << pinned_bytes / (double)(1<<30) << " GB" << std::endl;
-}
-
-void PairSortGPU::create_active_mask() {
-    std::mt19937 rng(123);
-    std::uniform_int_distribution<uint32_t> worker_dist(0, N_WORKERS - 1);
-    uint32_t worker_id = worker_dist(rng);
-
-    memset(active_mask, 0, sizeof(active_mask));
-    for (uint32_t i = 0; i < MAX_INSTANCES; i++)
-        if (i % N_WORKERS == worker_id)
-            active_mask[i / 32] |= (1u << (i % 32));
-}
-
-void PairSortGPU::pick_active_instances() {
-    constexpr uint32_t gid_offset[3] = {0, MAX_INST_ROM, MAX_INST_ROM + MAX_INST_INPUT};
-    uint32_t ao = 0;
-    for (uint8_t r = 0; r < 3; r++) {
-        na_per[r] = 0;
-        active_offset[r] = ao;
-        for (uint32_t lid = 0; lid < num_inst[r]; lid++) {
-            uint32_t gid = lid + gid_offset[r];
-            if (active_mask[gid / 32] & (1u << (gid % 32)))
-                h_active_lids[ao + na_per[r]++] = lid;
-        }
-        ao += na_per[r];
-    }
-    num_active = na_per[0] + na_per[1] + na_per[2];
-
-    std::cout << "  Instances: " << num_instances
-              << " (ROM: " << num_inst[0] << ", INPUT: " << num_inst[1] << ", RAM: " << num_inst[2] << ")"
-              << ", Active: " << num_active
-              << " (ROM: " << na_per[0] << ", INPUT: " << na_per[1] << ", RAM: " << na_per[2] << ")"
-              << std::endl;
-    std::cout << "  Active global IDs:";
-    for (uint32_t i = 0; i < num_instances; i++)
-        if (active_mask[i / 32] & (1u << (i % 32)))
-            std::cout << " " << i;
-    std::cout << std::endl;
-
-    cudaMemcpy(d_active_ids, h_active_lids, num_active * sizeof(uint32_t), cudaMemcpyHostToDevice);
+              << "  GPU:         " << gpu_bytes / (double)(1 << 30) << " GB" << std::endl
+              << "  Host pinned: " << pinned_bytes / (double)(1 << 30) << " GB" << std::endl;
 }
 
 PairSortGPU::~PairSortGPU() {
-    // GPU
     cudaFree(d_ops);
     cudaFree(d_hist);
     cudaFree(d_prefix);
@@ -640,25 +612,80 @@ PairSortGPU::~PairSortGPU() {
     cudaFree(d_offset_starts);
     cudaFree(d_chunk_offsets);
 
-    // Streams
     for (int s = 0; s < N_STREAMS; s++)
         cudaStreamDestroy(streams[s]);
     cudaStreamDestroy(d2h_stream);
     cudaStreamDestroy(meta_stream);
 
-    // Host
     cudaFreeHost(h_ops);
     cudaFreeHost(h_offsets_buf);
     cudaFreeHost(h_result_nops);
     cudaFreeHost(h_meta_scalars);
+
     delete[] h_vals;
-    delete[] out_ops_rom;   delete[] out_vals_rom;
-    delete[] out_ops_input; delete[] out_vals_input;
-    delete[] out_ops_ram;   delete[] out_vals_ram;
-    delete[] ref_ops_rom;   delete[] ref_vals_rom;
-    delete[] ref_ops_input; delete[] ref_vals_input;
-    delete[] ref_ops_ram;   delete[] ref_vals_ram;
+    delete[] out_ops_rom;
+    delete[] out_vals_rom;
+    delete[] out_ops_input;
+    delete[] out_vals_input;
+    delete[] out_ops_ram;
+    delete[] out_vals_ram;
+    delete[] ref_ops_rom;
+    delete[] ref_vals_rom;
+    delete[] ref_ops_input;
+    delete[] ref_vals_input;
+    delete[] ref_ops_ram;
+    delete[] ref_vals_ram;
 }
+
+void PairSortGPU::create_active_mask() {
+    std::mt19937 rng(123);
+    std::uniform_int_distribution<uint32_t> dist(0, N_WORKERS - 1);
+    uint32_t worker_id = dist(rng);
+
+    memset(active_mask, 0, sizeof(active_mask));
+    for (uint32_t i = 0; i < MAX_INSTANCES; i++)
+        if (i % N_WORKERS == worker_id)
+            active_mask[i / 32] |= (1u << (i % 32));
+}
+
+void PairSortGPU::pick_active_instances() {
+    uint32_t pos = 0;
+    uint32_t gid_base = 0;
+    for (uint8_t r = 0; r < 3; r++) {
+        num_active_per[r] = 0;
+        active_offset[r] = pos;
+        for (uint32_t lid = 0; lid < num_inst[r]; lid++) {
+            uint32_t gid = gid_base + lid;
+            if (active_mask[gid / 32] & (1u << (gid % 32)))
+                h_active_local_ids[pos + num_active_per[r]++] = lid;
+        }
+        pos += num_active_per[r];
+        gid_base += num_inst[r];
+    }
+    num_active = num_active_per[0] + num_active_per[1] + num_active_per[2];
+
+    std::cout << "  Instances: " << num_instances
+              << " (ROM: " << num_inst[0]
+              << ", INPUT: " << num_inst[1]
+              << ", RAM: " << num_inst[2] << ")"
+              << ", Active: " << num_active
+              << " (ROM: " << num_active_per[0]
+              << ", INPUT: " << num_active_per[1]
+              << ", RAM: " << num_active_per[2] << ")"
+              << std::endl;
+    std::cout << "  Active global IDs:";
+    for (uint32_t i = 0; i < num_instances; i++)
+        if (active_mask[i / 32] & (1u << (i % 32)))
+            std::cout << " " << i;
+    std::cout << std::endl;
+
+    cudaMemcpy(d_active_ids, h_active_local_ids,
+               num_active * sizeof(uint32_t), cudaMemcpyHostToDevice);
+}
+
+// =====================================================================
+// Pipeline stages
+// =====================================================================
 
 void PairSortGPU::generate(uint32_t block_number) {
     std::cout << std::endl << "=== Generate (block " << block_number << ") ===" << std::endl;
@@ -667,7 +694,6 @@ void PairSortGPU::generate(uint32_t block_number) {
     chunk_offsets.clear();
     chunk_offsets.push_back(0);
     uint32_t total_ops = 0;
-
     char path[512];
 
     for (uint32_t file_idx = 0; ; file_idx++) {
@@ -685,8 +711,11 @@ void PairSortGPU::generate(uint32_t block_number) {
             break;
         }
 
-        // Read ALL entries directly into h_ops (no filtering)
-        (void)fread(h_ops + total_ops, sizeof(uint32_t), n_entries, f);
+        size_t read = fread(h_ops + total_ops, sizeof(uint32_t), n_entries, f);
+        if (read != n_entries) {
+            fclose(f);
+            break;
+        }
         fclose(f);
 
         if (n_entries > 0) {
@@ -697,27 +726,23 @@ void PairSortGPU::generate(uint32_t block_number) {
         if (chunk_offsets.size() - 1 >= MAX_CHUNKS) break;
     }
 
-    n_ops = total_ops;
-    if (n_ops == 0) {
+    num_ops = total_ops;
+    if (num_ops == 0) {
         std::cerr << "  ERROR: no ops found" << std::endl;
         exit(1);
     }
     num_chunks = chunk_offsets.size() - 1;
 
-    // num_instances will be computed after prefix sum in gpu_metadata
-
-    // Set values (global index)
-    for (uint32_t i = 0; i < n_ops; i++)
+    for (uint32_t i = 0; i < num_ops; i++)
         h_vals[i] = i;
 
-    // Copy chunk_offsets to GPU
     cudaMemcpy(d_chunk_offsets, chunk_offsets.data(),
                (num_chunks + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
     create_active_mask();
 
     std::cout << std::fixed << std::setprecision(2)
-              << "  " << n_ops << " ops in " << num_chunks << " chunks"
+              << "  " << num_ops << " ops in " << num_chunks << " chunks"
               << " (" << (omp_get_wtime() - t) * 1e3 << " ms)" << std::endl;
 }
 
@@ -725,36 +750,33 @@ void PairSortGPU::gpu_metadata() {
     std::cout << std::endl << "=== GPU Metadata ===" << std::endl;
     double t_total = omp_get_wtime(), t;
 
-    // Clear histogram
+    // H2D + shift + histogram (pipelined by chunks)
     cudaMemset(d_hist, 0, (size_t)N_ADDR * sizeof(uint32_t));
-
-    // H2D + shift + histogram pipelined by chunks
     t = omp_get_wtime();
     int sh_block, sh_grid;
     cudaOccupancyMaxPotentialBlockSize(&sh_grid, &sh_block, shift_and_histogram_kernel, 0, 0);
+
     for (uint32_t c = 0; c < num_chunks - 1; c++) {
         int s = c % N_STREAMS;
-        uint32_t offset = chunk_offsets[c];
-        uint32_t chunk_size = chunk_offsets[c + 1] - offset;
-        size_t chunk_bytes = (size_t)chunk_size * sizeof(uint32_t);
-        cudaMemcpyAsync(d_ops + offset, h_ops + offset, chunk_bytes,
-                        cudaMemcpyHostToDevice, streams[s]);
+        uint32_t off  = chunk_offsets[c];
+        uint32_t size = chunk_offsets[c + 1] - off;
+        cudaMemcpyAsync(d_ops + off, h_ops + off,
+                        (size_t)size * sizeof(uint32_t), cudaMemcpyHostToDevice, streams[s]);
         shift_and_histogram_kernel<<<sh_grid, sh_block, 0, streams[s]>>>(
-            d_ops + offset, d_hist, chunk_size);
+            d_ops + off, d_hist, size);
     }
-    cudaDeviceSynchronize();  // all prior chunks done
+    cudaDeviceSynchronize();
 
     double t_last_chunk = omp_get_wtime();
     {
-        uint32_t c = num_chunks - 1;
-        int s = c % N_STREAMS;
-        uint32_t offset = chunk_offsets[c];
-        uint32_t chunk_size = chunk_offsets[c + 1] - offset;
-        size_t chunk_bytes = (size_t)chunk_size * sizeof(uint32_t);
-        cudaMemcpyAsync(d_ops + offset, h_ops + offset, chunk_bytes,
-                        cudaMemcpyHostToDevice, streams[s]);
+        uint32_t c   = num_chunks - 1;
+        int s        = c % N_STREAMS;
+        uint32_t off  = chunk_offsets[c];
+        uint32_t size = chunk_offsets[c + 1] - off;
+        cudaMemcpyAsync(d_ops + off, h_ops + off,
+                        (size_t)size * sizeof(uint32_t), cudaMemcpyHostToDevice, streams[s]);
         shift_and_histogram_kernel<<<sh_grid, sh_block, 0, streams[s]>>>(
-            d_ops + offset, d_hist, chunk_size);
+            d_ops + off, d_hist, size);
     }
     cudaDeviceSynchronize();
     std::cout << std::fixed << std::setprecision(2)
@@ -763,28 +785,27 @@ void PairSortGPU::gpu_metadata() {
     // Prefix sum
     t = omp_get_wtime();
     cub::DeviceScan::ExclusiveSum(d_temp, d_temp_bytes, d_hist, d_prefix, N_ADDR);
-    cudaMemcpy(d_prefix + N_ADDR, &n_ops, sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_prefix + N_ADDR, &num_ops, sizeof(uint32_t), cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
     std::cout << std::fixed << std::setprecision(2)
               << "  Prefix sum:       " << (omp_get_wtime() - t) * 1e3 << " ms" << std::endl;
 
-    // --- Compute per-region instance counts from prefix boundary values ---
+    // Compute per-region instance counts from prefix boundary values
     t = omp_get_wtime();
     uint32_t h_boundary[3];
-    cudaMemcpy(&h_boundary[0], d_prefix + N_ADDR_ROM, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_boundary[0], d_prefix + N_ADDR_ROM,                sizeof(uint32_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(&h_boundary[1], d_prefix + N_ADDR_ROM + N_ADDR_INPUT, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    h_boundary[2] = n_ops;
+    h_boundary[2] = num_ops;
 
     region_n_ops[REGION_ROM]   = h_boundary[0];
     region_n_ops[REGION_INPUT] = h_boundary[1] - h_boundary[0];
     region_n_ops[REGION_RAM]   = h_boundary[2] - h_boundary[1];
 
-    constexpr uint32_t MAX_INST[3] = {MAX_INST_ROM, MAX_INST_INPUT, MAX_INST_RAM};
     num_instances = 0;
     for (uint8_t r = 0; r < 3; r++) {
         num_inst[r] = region_n_ops[r] ? (region_n_ops[r] + INSTANCE_SIZE - 1) / INSTANCE_SIZE : 0;
         if (num_inst[r] > MAX_INST[r]) {
-            std::cerr << "ERROR: too many instances in region " << (int)r
+            std::cerr << "ERROR: too many instances in region " << REGION_NAME[r]
                       << " (" << num_inst[r] << " > " << MAX_INST[r] << ")" << std::endl;
             exit(1);
         }
@@ -796,101 +817,95 @@ void PairSortGPU::gpu_metadata() {
     region_ops_start[REGION_RAM]   = h_boundary[1];
 
     std::cout << std::fixed << std::setprecision(2)
-              << "  Region counts: ROM=" << region_n_ops[REGION_ROM]
-              << " (" << num_inst[0] << " inst), INPUT=" << region_n_ops[REGION_INPUT]
-              << " (" << num_inst[1] << " inst), RAM=" << region_n_ops[REGION_RAM]
-              << " (" << num_inst[2] << " inst), total=" << num_instances << " inst" << std::endl;
+              << "  Region counts:"
+              << " ROM=" << region_n_ops[0] << " (" << num_inst[0] << " inst),"
+              << " INPUT=" << region_n_ops[1] << " (" << num_inst[1] << " inst),"
+              << " RAM=" << region_n_ops[2] << " (" << num_inst[2] << " inst),"
+              << " total=" << num_instances << " inst" << std::endl;
 
     pick_active_instances();
 
-    // GPU: per-region instance boundaries + chunk FML counts
+    // Per-region instance boundaries + chunk FML counts
     int fml_block, fml_grid;
     cudaOccupancyMaxPotentialBlockSize(&fml_grid, &fml_block, chunk_fml_count_kernel, 0, 0);
-    size_t runtime_fml_size = (size_t)num_active * num_chunks * 3;
-    cudaMemset(d_fml, 0, runtime_fml_size * sizeof(uint32_t));
+    cudaMemset(d_fml, 0, (size_t)num_active * num_chunks * 3 * sizeof(uint32_t));
 
     for (uint8_t r = 0; r < 3; r++) {
-        if (na_per[r] == 0) continue;
-        uint32_t na = na_per[r];
+        if (num_active_per[r] == 0) continue;
+        uint32_t na  = num_active_per[r];
+        uint32_t off = active_offset[r];
 
         instance_boundaries_kernel<<<1, na>>>(
             d_prefix, REGION_ADDR_START[r], REGION_N_ADDR[r],
             region_n_ops[r], region_ops_start[r],
-            d_active_ids + active_offset[r], d_active_first + active_offset[r], d_active_last + active_offset[r],
-            d_offset_starts + active_offset[r], na);
+            d_active_ids + off, d_active_first + off, d_active_last + off,
+            d_offset_starts + off, na);
 
         chunk_fml_count_kernel<<<fml_grid, fml_block>>>(
-            d_ops, d_active_first + active_offset[r], d_active_last + active_offset[r], d_chunk_offsets,
-            d_fml + (size_t)active_offset[r] * num_chunks * 3, na, num_chunks, n_ops);
+            d_ops, d_active_first + off, d_active_last + off, d_chunk_offsets,
+            d_fml + (size_t)off * num_chunks * 3, na, num_chunks, num_ops);
     }
     cudaDeviceSynchronize();
 
     // D2H: active boundaries
-    const size_t active_bytes = num_active * sizeof(uint32_t);
-    cudaMemcpy(h_active_first.data(), d_active_first, active_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_active_last.data(), d_active_last, active_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_active_first.data(), d_active_first, num_active * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_active_last.data(),  d_active_last,  num_active * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     std::cout << std::fixed << std::setprecision(2)
               << "  Boundaries + FML: " << (omp_get_wtime() - t) * 1e3 << " ms" << std::endl;
 
-    // --- Build metas + addr_offsets: all on GPU, overlapped ---
+    // Build metas + addr_offsets (overlapped on two streams)
     t = omp_get_wtime();
 
-    // Compute offset_starts + total_addrs from already-D2H'd boundaries
     std::vector<uint32_t> h_offset_starts(num_active);
     uint32_t total_addrs = 0;
     for (uint32_t i = 0; i < num_active; i++) {
         h_offset_starts[i] = total_addrs;
         total_addrs += h_active_last[i] - h_active_first[i] + 1;
     }
-    size_t total_offsets_bytes = (size_t)total_addrs * sizeof(uint32_t);
 
-    // Launch per-region build_metas + addr_offsets
     for (uint8_t r = 0; r < 3; r++) {
-        if (na_per[r] == 0) continue;
-        uint32_t na = na_per[r];
+        if (num_active_per[r] == 0) continue;
+        uint32_t na  = num_active_per[r];
+        uint32_t off = active_offset[r];
 
         build_metas_kernel<<<na, 256, 0, meta_stream>>>(
-            d_fml + (size_t)active_offset[r] * num_chunks * 3, d_prefix,
+            d_fml + (size_t)off * num_chunks * 3, d_prefix,
             region_n_ops[r], region_ops_start[r],
-            d_active_ids + active_offset[r], d_active_first + active_offset[r], d_active_last + active_offset[r],
-            d_result_nops + (size_t)active_offset[r] * num_chunks,
-            d_meta_scalars + active_offset[r] * 4, na, num_chunks);
+            d_active_ids + off, d_active_first + off, d_active_last + off,
+            d_result_nops + (size_t)off * num_chunks,
+            d_meta_scalars + off * 4, na, num_chunks);
 
         compute_addr_offsets_kernel<<<na, 1024, 0, d2h_stream>>>(
             d_prefix, region_n_ops[r], region_ops_start[r],
-            d_active_ids + active_offset[r], d_active_first + active_offset[r], d_active_last + active_offset[r],
-            d_addr_offsets, d_offset_starts + active_offset[r], na);
+            d_active_ids + off, d_active_first + off, d_active_last + off,
+            d_addr_offsets, d_offset_starts + off, na);
     }
 
-    // Queue D2H for meta results on meta_stream
-    cudaMemcpyAsync(h_meta_scalars, d_meta_scalars, num_active * 4 * sizeof(uint32_t),
-                    cudaMemcpyDeviceToHost, meta_stream);
-    cudaMemcpyAsync(h_result_nops, d_result_nops, (size_t)num_active * num_chunks * sizeof(uint32_t),
-                    cudaMemcpyDeviceToHost, meta_stream);
+    cudaMemcpyAsync(h_meta_scalars, d_meta_scalars,
+                    num_active * 4 * sizeof(uint32_t), cudaMemcpyDeviceToHost, meta_stream);
+    cudaMemcpyAsync(h_result_nops, d_result_nops,
+                    (size_t)num_active * num_chunks * sizeof(uint32_t), cudaMemcpyDeviceToHost, meta_stream);
+    cudaMemcpyAsync(h_offsets_buf, d_addr_offsets,
+                    (size_t)total_addrs * sizeof(uint32_t), cudaMemcpyDeviceToHost, d2h_stream);
 
-    // Queue addr_offsets D2H
-    cudaMemcpyAsync(h_offsets_buf, d_addr_offsets, total_offsets_bytes,
-                    cudaMemcpyDeviceToHost, d2h_stream);
-
-    // Wait for both streams
     cudaStreamSynchronize(meta_stream);
     cudaStreamSynchronize(d2h_stream);
 
-    // Populate metas — per-region, packed order
-    uint32_t ai_idx = 0;
+    // Populate InstanceMeta structs
+    uint32_t ai = 0;
     for (uint8_t r = 0; r < 3; r++) {
-        for (uint32_t j = 0; j < na_per[r]; j++, ai_idx++) {
-            uint32_t* sc = h_meta_scalars + ai_idx * 4;
-            metas[ai_idx].inst_id = h_active_lids[active_offset[r] + j];
-            metas[ai_idx].type = r;
-            metas[ai_idx].first_addr = h_active_first[ai_idx];
-            metas[ai_idx].last_addr = h_active_last[ai_idx];
-            metas[ai_idx].first_addr_chunk = sc[0];
-            metas[ai_idx].first_addr_skip = sc[1];
-            metas[ai_idx].last_addr_chunk = sc[2];
-            metas[ai_idx].last_addr_include = sc[3];
-            metas[ai_idx].addr_offsets = h_offsets_buf + h_offset_starts[ai_idx];
-            metas[ai_idx].nops_per_chunk = h_result_nops + (size_t)ai_idx * num_chunks;
+        for (uint32_t j = 0; j < num_active_per[r]; j++, ai++) {
+            uint32_t* scalars      = h_meta_scalars + ai * 4;
+            metas[ai].inst_id      = h_active_local_ids[active_offset[r] + j];
+            metas[ai].type         = r;
+            metas[ai].first_addr   = h_active_first[ai];
+            metas[ai].last_addr    = h_active_last[ai];
+            metas[ai].first_addr_chunk   = scalars[0];
+            metas[ai].first_addr_skip    = scalars[1];
+            metas[ai].last_addr_chunk    = scalars[2];
+            metas[ai].last_addr_include  = scalars[3];
+            metas[ai].addr_offsets       = h_offsets_buf + h_offset_starts[ai];
+            metas[ai].nops_per_chunk     = h_result_nops + (size_t)ai * num_chunks;
         }
     }
 
@@ -902,59 +917,60 @@ void PairSortGPU::gpu_metadata() {
 
 void PairSortGPU::cpu_fill() {
     std::cout << std::endl << "=== CPU Fill ===" << std::endl;
-    double t_total = omp_get_wtime();
+    double t = omp_get_wtime();
 
     #pragma omp parallel for schedule(dynamic, 1)
     for (size_t idx = 0; idx < num_active; idx++) {
         auto& m = metas[idx];
         bool single_addr = (m.first_addr == m.last_addr);
 
-        // Select per-region output arrays
-        uint32_t *o_ops, *o_vals;
-        if (m.type == REGION_ROM)        { o_ops = out_ops_rom;   o_vals = out_vals_rom; }
+        uint32_t* o_ops;
+        uint32_t* o_vals;
+        if (m.type == REGION_ROM)        { o_ops = out_ops_rom;   o_vals = out_vals_rom;   }
         else if (m.type == REGION_INPUT) { o_ops = out_ops_input; o_vals = out_vals_input; }
-        else                             { o_ops = out_ops_ram;   o_vals = out_vals_ram; }
+        else                             { o_ops = out_ops_ram;   o_vals = out_vals_ram;   }
 
-        uint32_t inst_size = std::min(INSTANCE_SIZE, region_n_ops[m.type] - m.inst_id * INSTANCE_SIZE);
-        uint32_t out_base = m.inst_id * INSTANCE_SIZE;
+        uint32_t inst_size     = std::min(INSTANCE_SIZE, region_n_ops[m.type] - m.inst_id * INSTANCE_SIZE);
+        uint32_t out_base      = m.inst_id * INSTANCE_SIZE;
         uint32_t total_written = 0;
-        for (uint32_t chunk_gid = 0; chunk_gid < num_chunks; chunk_gid++) {
-            uint32_t expected = m.nops_per_chunk[chunk_gid];
+
+        for (uint32_t chunk = 0; chunk < num_chunks; chunk++) {
+            uint32_t expected = m.nops_per_chunk[chunk];
             if (expected == 0) continue;
-            uint32_t chunk_start = chunk_offsets[chunk_gid];
-            uint32_t chunk_size = chunk_offsets[chunk_gid + 1] - chunk_start;
-            uint32_t found = 0;
+
+            uint32_t chunk_start = chunk_offsets[chunk];
+            uint32_t chunk_size  = chunk_offsets[chunk + 1] - chunk_start;
+            uint32_t found       = 0;
             uint32_t first_found = 0;
-            uint32_t last_found = 0;
+            uint32_t last_found  = 0;
 
             for (uint32_t j = 0; j < chunk_size && found < expected; j++) {
-                uint32_t raw = h_ops[chunk_start + j];
+                uint32_t raw  = h_ops[chunk_start + j];
                 uint32_t addr = compact_addr(raw);
                 if (addr < m.first_addr || addr > m.last_addr) continue;
                 uint32_t ind = addr - m.first_addr;
                 found++;
 
-                // Skip logic for first/last address boundaries
                 bool skip = false;
                 if (addr == m.first_addr) {
                     first_found++;
-                    if (chunk_gid < m.first_addr_chunk) skip = true;
-                    else if (chunk_gid == m.first_addr_chunk && first_found <= m.first_addr_skip) skip = true;
+                    if (chunk < m.first_addr_chunk) skip = true;
+                    else if (chunk == m.first_addr_chunk && first_found <= m.first_addr_skip) skip = true;
                     else if (single_addr) {
-                        if (chunk_gid > m.last_addr_chunk) skip = true;
-                        else if (chunk_gid == m.last_addr_chunk && first_found > m.last_addr_include) skip = true;
+                        if (chunk > m.last_addr_chunk) skip = true;
+                        else if (chunk == m.last_addr_chunk && first_found > m.last_addr_include) skip = true;
                     }
                 } else if (addr == m.last_addr) {
                     last_found++;
-                    if (chunk_gid > m.last_addr_chunk) skip = true;
-                    else if (chunk_gid == m.last_addr_chunk && last_found > m.last_addr_include) skip = true;
+                    if (chunk > m.last_addr_chunk) skip = true;
+                    else if (chunk == m.last_addr_chunk && last_found > m.last_addr_include) skip = true;
                 }
                 if (skip) continue;
 
                 uint32_t pos = m.addr_offsets[ind]++;
                 if (pos == 0) continue;  // halo entry
                 uint32_t out_pos = out_base + pos - 1;
-                o_ops[out_pos] = raw;
+                o_ops[out_pos]  = raw;
                 o_vals[out_pos] = h_vals[chunk_start + j];
                 total_written++;
                 if (total_written >= inst_size) break;
@@ -964,50 +980,47 @@ void PairSortGPU::cpu_fill() {
     }
 
     std::cout << std::fixed << std::setprecision(2)
-              << "  " << num_active << " instances in " << (omp_get_wtime() - t_total) * 1e3 << " ms" << std::endl;
+              << "  " << num_active << " instances in " << (omp_get_wtime() - t) * 1e3 << " ms" << std::endl;
 }
 
 void PairSortGPU::reference_sort() {
     std::cout << std::endl << "=== Verify ===" << std::endl;
     double t = omp_get_wtime();
 
-    struct Triple { uint32_t compact, pos, val; uint32_t raw; };
-    std::vector<Triple> triples(n_ops);
-    for (uint32_t i = 0; i < n_ops; i++)
+    struct Triple { uint32_t compact, pos, val, raw; };
+    std::vector<Triple> triples(num_ops);
+    for (uint32_t i = 0; i < num_ops; i++)
         triples[i] = {compact_addr(h_ops[i]), i, h_vals[i], h_ops[i]};
     std::sort(triples.begin(), triples.end(), [](const Triple& a, const Triple& b) {
         return a.compact < b.compact || (a.compact == b.compact && a.pos < b.pos);
     });
 
-    // Zero per-region ref arrays
-    memset(ref_ops_rom,   0, (size_t)MAX_INST_ROM   * INSTANCE_SIZE * sizeof(uint32_t));
-    memset(ref_vals_rom,  0, (size_t)MAX_INST_ROM   * INSTANCE_SIZE * sizeof(uint32_t));
-    memset(ref_ops_input, 0, (size_t)MAX_INST_INPUT * INSTANCE_SIZE * sizeof(uint32_t));
-    memset(ref_vals_input,0, (size_t)MAX_INST_INPUT * INSTANCE_SIZE * sizeof(uint32_t));
-    memset(ref_ops_ram,   0, (size_t)MAX_INST_RAM   * INSTANCE_SIZE * sizeof(uint32_t));
-    memset(ref_vals_ram,  0, (size_t)MAX_INST_RAM   * INSTANCE_SIZE * sizeof(uint32_t));
+    memset(ref_ops_rom,    0, (size_t)MAX_INST_ROM   * INSTANCE_SIZE * sizeof(uint32_t));
+    memset(ref_vals_rom,   0, (size_t)MAX_INST_ROM   * INSTANCE_SIZE * sizeof(uint32_t));
+    memset(ref_ops_input,  0, (size_t)MAX_INST_INPUT * INSTANCE_SIZE * sizeof(uint32_t));
+    memset(ref_vals_input, 0, (size_t)MAX_INST_INPUT * INSTANCE_SIZE * sizeof(uint32_t));
+    memset(ref_ops_ram,    0, (size_t)MAX_INST_RAM   * INSTANCE_SIZE * sizeof(uint32_t));
+    memset(ref_vals_ram,   0, (size_t)MAX_INST_RAM   * INSTANCE_SIZE * sizeof(uint32_t));
 
-    // Place sorted entries into per-region ref arrays
-    for (uint32_t p = 0; p < n_ops; p++) {
+    for (uint32_t p = 0; p < num_ops; p++) {
         uint32_t ca = triples[p].compact;
-        uint32_t *r_ops, *r_vals;
+        uint32_t* r_ops;
+        uint32_t* r_vals;
         uint32_t local_p;
+
         if (ca < N_ADDR_ROM) {
-            r_ops = ref_ops_rom; r_vals = ref_vals_rom;
+            r_ops   = ref_ops_rom;   r_vals = ref_vals_rom;
             local_p = p - region_ops_start[REGION_ROM];
         } else if (ca < N_ADDR_ROM + N_ADDR_INPUT) {
-            r_ops = ref_ops_input; r_vals = ref_vals_input;
+            r_ops   = ref_ops_input; r_vals = ref_vals_input;
             local_p = p - region_ops_start[REGION_INPUT];
         } else {
-            r_ops = ref_ops_ram; r_vals = ref_vals_ram;
+            r_ops   = ref_ops_ram;   r_vals = ref_vals_ram;
             local_p = p - region_ops_start[REGION_RAM];
         }
 
-        uint32_t inst_local = local_p / INSTANCE_SIZE;
-        uint32_t local_pos = local_p % INSTANCE_SIZE;
-        uint32_t out_idx = inst_local * INSTANCE_SIZE + local_pos;
-
-        r_ops[out_idx] = triples[p].raw;
+        uint32_t out_idx = local_p;  // inst_local * INSTANCE_SIZE + local_pos == local_p
+        r_ops[out_idx]  = triples[p].raw;
         r_vals[out_idx] = triples[p].val;
     }
 
@@ -1018,51 +1031,60 @@ void PairSortGPU::reference_sort() {
 void PairSortGPU::verify() {
     double t = omp_get_wtime();
     uint32_t total_verified = 0;
+
     for (uint32_t idx = 0; idx < num_active; idx++) {
         auto& m = metas[idx];
 
-        // Select per-region arrays
-        uint32_t *o_ops, *o_vals, *r_ops, *r_vals;
+        uint32_t* o_ops;  uint32_t* o_vals;
+        uint32_t* r_ops;  uint32_t* r_vals;
         if (m.type == REGION_ROM) {
-            o_ops = out_ops_rom; o_vals = out_vals_rom;
-            r_ops = ref_ops_rom; r_vals = ref_vals_rom;
+            o_ops = out_ops_rom;   o_vals = out_vals_rom;
+            r_ops = ref_ops_rom;   r_vals = ref_vals_rom;
         } else if (m.type == REGION_INPUT) {
             o_ops = out_ops_input; o_vals = out_vals_input;
             r_ops = ref_ops_input; r_vals = ref_vals_input;
         } else {
-            o_ops = out_ops_ram; o_vals = out_vals_ram;
-            r_ops = ref_ops_ram; r_vals = ref_vals_ram;
+            o_ops = out_ops_ram;   o_vals = out_vals_ram;
+            r_ops = ref_ops_ram;   r_vals = ref_vals_ram;
         }
 
         uint32_t inst_size = std::min(INSTANCE_SIZE, region_n_ops[m.type] - m.inst_id * INSTANCE_SIZE);
-        uint32_t start = m.inst_id * INSTANCE_SIZE;
-        const char* region_name[] = {"ROM", "INPUT", "RAM"};
+        uint32_t start     = m.inst_id * INSTANCE_SIZE;
 
         for (uint32_t j = 0; j < inst_size; j++) {
             uint32_t ind = start + j;
             if (o_ops[ind] != r_ops[ind] || o_vals[ind] != r_vals[ind]) {
-                std::cout << "MISMATCH " << region_name[m.type] << " inst " << m.inst_id
-                          << " local " << j << ": got (" << o_ops[ind] << "," << o_vals[ind]
-                          << ") expected (" << r_ops[ind] << "," << r_vals[ind] << ")" << std::endl;
+                std::cout << "MISMATCH " << REGION_NAME[m.type] << " inst " << m.inst_id
+                          << " local " << j
+                          << ": got (" << o_ops[ind] << "," << o_vals[ind] << ")"
+                          << " expected (" << r_ops[ind] << "," << r_vals[ind] << ")" << std::endl;
                 return;
             }
         }
         total_verified += inst_size;
     }
+
     std::cout << std::fixed << std::setprecision(2)
               << "  Verify:           " << (omp_get_wtime() - t) * 1e3
               << " ms -- " << total_verified << " entries, " << num_active << " instances OK" << std::endl;
 }
 
 // =====================================================================
+// Main
+// =====================================================================
 
 int main(int argc, char** argv) {
     bool do_verify = false;
     uint32_t block_number = 0;
     bool have_block = false;
+
     for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "-v") do_verify = true;
-        else { block_number = std::strtoul(argv[i], nullptr, 10); have_block = true; }
+        if (std::string(argv[i]) == "-v")
+            do_verify = true;
+        else {
+            block_number = std::strtoul(argv[i], nullptr, 10);
+            have_block = true;
+        }
     }
     if (!have_block) {
         std::cerr << "Usage: " << argv[0] << " <block_number> [-v]" << std::endl;
