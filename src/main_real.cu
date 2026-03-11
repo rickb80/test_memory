@@ -141,6 +141,19 @@ __global__ void instance_boundaries_kernel(
         if (prefix[mid] < inst_end) lo = mid;
         else hi = mid - 1;
     }
+
+    // Trim trailing addresses with 0 ops: find largest addr with prefix[addr] < prefix[lo+1]
+    // (i.e. last address that actually has histogram entries)
+    {
+        uint32_t max_prefix = prefix[lo + 1];
+        uint32_t tlo = active_first[idx], thi = lo;
+        while (tlo < thi) {
+            uint32_t mid = tlo + (thi - tlo + 1) / 2;
+            if (prefix[mid] < max_prefix) tlo = mid;
+            else thi = mid - 1;
+        }
+        lo = tlo;
+    }
     active_last[idx] = lo;
 
     // Thread 0 computes offset_starts (serial prefix sum over address counts)
