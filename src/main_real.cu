@@ -34,14 +34,16 @@ constexpr uint32_t MAX_CHUNKS = 4096;
 constexpr int      N_STREAMS  = 4;
 
 // Region identifiers
-constexpr uint8_t REGION_ROM   = 0;
-constexpr uint8_t REGION_INPUT = 1;
-constexpr uint8_t REGION_RAM   = 2;
-constexpr const char* REGION_NAME[3] = {"ROM", "INPUT", "RAM"};
-
-// Compact address space layout: [ROM: 0..16M) [INPUT: 16M..32M) [RAM: 32M..96M)
+constexpr uint8_t REGION_ROM            = 0;
+constexpr uint8_t REGION_INPUT          = 1;
+constexpr uint8_t REGION_RAM            = 2;
+constexpr const char* REGION_NAME[3]    = {"ROM", "INPUT", "RAM"};
 constexpr uint32_t REGION_ADDR_START[3] = {0, N_ADDR_ROM, N_ADDR_ROM + N_ADDR_INPUT};
 constexpr uint32_t REGION_N_ADDR[3]     = {N_ADDR_ROM, N_ADDR_INPUT, N_ADDR_RAM};
+
+// =====================================================================
+// Helper Functions
+// =====================================================================
 
 // Maps raw hardware address to compact address space
 inline uint32_t compact_addr(uint32_t raw) {
@@ -52,11 +54,27 @@ inline uint32_t compact_addr(uint32_t raw) {
     return (raw - 0x80000000u) >> 3;
 }
 
+// Maps compact address back to raw hardware address
+inline uint32_t expand_addr(uint32_t compact) {
+    if (compact >= N_ADDR_ROM + N_ADDR_INPUT)
+        return ((compact - N_ADDR_ROM - N_ADDR_INPUT) << 3) + 0xA0000000u;
+    if (compact >= N_ADDR_ROM)
+        return ((compact - N_ADDR_ROM) << 3) + 0x90000000u;
+    return (compact << 3) + 0x80000000u;
+}
+
 // =====================================================================
 // GPU Kernels
 // =====================================================================
 
-// Converts raw addresses to compact space in-place and builds histogram
+// Converts raw hardware addresses to compact address space in-place and
+// accumulates a histogram of compact addresses. Can be called incrementally
+// on different slices of ops — hist is accumulated across calls via atomicAdd,
+// so the caller must zero it before the first call.
+//
+// In/Out: ops[num_ops]       — raw addresses on entry, compact addresses on exit
+// In/Out: hist[N_ADDR]       — histogram accumulated in-place
+// Input:  num_ops            — number of operations in this slice
 __global__ void shift_and_histogram_kernel(uint32_t* ops, uint32_t* hist, uint32_t num_ops) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t stride = gridDim.x * blockDim.x;
@@ -74,12 +92,23 @@ __global__ void shift_and_histogram_kernel(uint32_t* ops, uint32_t* hist, uint32
     }
 }
 
-// Finds first/last compact addresses for each active instance via binary search on prefix sums.
-// Also computes offset_starts (prefix sum of per-instance address counts).
+// Finds first/last compact addresses for each active instance via binary
+// search on the prefix-sum array. Also computes offset_starts for the
+// addr_offsets buffer. RR := region-relative (caller passes base pointer + region offset).
+//
+// Input:  prefix[N_ADDR+1]               — exclusive prefix sum of histogram
+// Input:  prefix_base_addr               — first compact address of this region
+// Input:  num_addr_region                — number of compact addresses in this region
+// Input:  num_ops_region                 — total ops in this region
+// Input:  active_ids[num_active]    (RR) — local instance IDs of active instances
+// Output: active_first[num_active]  (RR) — first compact address per active instance
+// Output: active_last[num_active]   (RR) — last compact address per active instance
+// Output: offset_starts[num_active] (RR) — write offset into addr_offsets per active instance
+// Input:  num_active                     — number of active instances in this region
 __global__ void instance_boundaries_kernel(
     const uint32_t* prefix,
     uint32_t prefix_base_addr, uint32_t num_addr_region,
-    uint32_t num_ops_region, uint32_t region_start,
+    uint32_t num_ops_region,
     const uint32_t* active_ids,
     uint32_t* active_first, uint32_t* active_last,
     uint32_t* offset_starts,
@@ -88,8 +117,9 @@ __global__ void instance_boundaries_kernel(
     uint32_t idx = threadIdx.x;
     if (idx >= num_active) return;
 
-    uint32_t local_inst = active_ids[idx];
-    uint32_t base_pos   = region_start + local_inst * INSTANCE_SIZE;
+    uint32_t local_inst  = active_ids[idx];
+    uint32_t region_start = prefix[prefix_base_addr];
+    uint32_t base_pos    = region_start + local_inst * INSTANCE_SIZE;
     uint32_t inst_size   = min(INSTANCE_SIZE, num_ops_region - local_inst * INSTANCE_SIZE);
     uint32_t inst_start  = (local_inst == 0) ? base_pos : base_pos - 1;
     uint32_t inst_end    = base_pos + inst_size;
@@ -114,6 +144,7 @@ __global__ void instance_boundaries_kernel(
     active_last[idx] = lo;
 
     // Thread 0 computes offset_starts (serial prefix sum over address counts)
+    // here we assume we launch one single block
     __syncthreads();
     if (idx == 0) {
         uint32_t offset = 0;
@@ -124,8 +155,15 @@ __global__ void instance_boundaries_kernel(
     }
 }
 
-// Counts first/middle/last address hits per (instance, chunk) pair.
-// Output: d_fml[instance][chunk][3] where [0]=first, [1]=middle, [2]=last.
+// Counts how many ops in each chunk hit the first, middle, or last compact
+// address of each active instance. Uses warp-level ballot for efficiency.
+//
+// Input:  ops[num_ops]                          — compact addresses (sorted)
+// Input:  active_first[num_active]              — first compact address per instance (all regions)
+// Input:  active_last[num_active]               — last compact address per instance (all regions)
+// Input:  chunk_offsets[num_chunks+1]           — start position of each chunk
+// Output: d_fml[num_active * num_chunks * 3]    — [ai][chunk][0/1/2] = first/middle/last counts
+// Input:  num_active, num_chunks, num_ops       — dimensions
 __global__ void chunk_fml_count_kernel(
     const uint32_t* ops,
     const uint32_t* active_first, const uint32_t* active_last,
@@ -187,12 +225,23 @@ __global__ void chunk_fml_count_kernel(
     }
 }
 
-// Builds per-instance metadata on GPU (one block per instance, 256 threads).
-// Determines first/last chunk boundaries and per-chunk op counts.
+// Builds per-instance metadata on GPU (one block per active instance, 256 threads).
+// Parameters marked (RR) are region-relative (caller passes base pointer + region offset).
+//
+// Input:  d_fml[num_active * num_chunks * 3]  (RR) — first/middle/last counts
+// Input:  prefix[N_ADDR+1]                         — exclusive prefix sum of histogram
+// Input:  prefix_base_addr                         — first compact address of this region
+// Input:  num_ops_region                           — total ops in this region
+// Input:  active_ids[num_active]              (RR) — local instance IDs in this region
+// Input:  active_first[num_active]            (RR) — first compact address per instance
+// Input:  active_last[num_active]             (RR) — last compact address per instance
+// Output: result_nops[num_active * num_chunks](RR) — per-chunk op count (0=eliminated)
+// Output: meta_scalars[num_active * 4]        (RR) — [fa_chunk, fa_skip, la_chunk, la_include]
+// Input:  num_active, num_chunks                   — dimensions
 __global__ void build_metas_kernel(
     const uint32_t* d_fml,
     const uint32_t* prefix,
-    uint32_t num_ops_region, uint32_t region_start,
+    uint32_t prefix_base_addr, uint32_t num_ops_region,
     const uint32_t* active_ids,
     const uint32_t* active_first, const uint32_t* active_last,
     uint32_t* result_nops,
@@ -258,10 +307,11 @@ __global__ void build_metas_kernel(
 
         s_single_addr = single_addr;
 
-        uint32_t local_inst = active_ids[ai];
-        uint32_t base_pos   = region_start + local_inst * INSTANCE_SIZE;
-        uint32_t inst_size  = min(INSTANCE_SIZE, num_ops_region - local_inst * INSTANCE_SIZE);
-        uint32_t halo_base  = (local_inst == 0) ? base_pos : base_pos - 1;
+        uint32_t local_inst   = active_ids[ai];
+        uint32_t region_start = prefix[prefix_base_addr];
+        uint32_t base_pos     = region_start + local_inst * INSTANCE_SIZE;
+        uint32_t inst_size    = min(INSTANCE_SIZE, num_ops_region - local_inst * INSTANCE_SIZE);
+        uint32_t halo_base    = (local_inst == 0) ? base_pos : base_pos - 1;
         s_first_addr_total_skip = halo_base - prefix[fa];
 
         if (!single_addr) {
@@ -391,10 +441,22 @@ __global__ void build_metas_kernel(
     }
 }
 
-// Computes per-address offsets within each instance for scatter positioning
+// Computes per-address write offsets within each instance for scatter positioning.
+// For each address in an instance's range, stores the offset into the instance's
+// output buffer where ops at that address should be written.
+//
+// Input:  prefix[N_ADDR+1]                 — exclusive prefix sum of histogram
+// Input:  prefix_base_addr                 — first compact address of this region
+// Input:  num_ops_region                   — total ops in this region
+// Input:  active_ids[num_active]      (RR) — local instance IDs in this region
+// Input:  active_first[num_active]    (RR) — first compact address per instance
+// Input:  active_last[num_active]     (RR) — last compact address per instance
+// Output: addr_offsets[total_addrs]   (RR) — write offset per address per instance
+// Input:  offset_starts[num_active]   (RR) — start index in addr_offsets per instance
+// Input:  num_active                       — number of active instances in this region
 __global__ void compute_addr_offsets_kernel(
     const uint32_t* prefix,
-    uint32_t num_ops_region, uint32_t region_start,
+    uint32_t prefix_base_addr, uint32_t num_ops_region,
     const uint32_t* active_ids,
     const uint32_t* active_first, const uint32_t* active_last,
     uint32_t* addr_offsets, const uint32_t* offset_starts,
@@ -407,9 +469,10 @@ __global__ void compute_addr_offsets_kernel(
     uint32_t la = active_last[ai];
     uint32_t num_addrs = la - fa + 1;
 
-    uint32_t local_inst = active_ids[ai];
-    uint32_t base_pos   = region_start + local_inst * INSTANCE_SIZE;
-    uint32_t halo_base  = (local_inst == 0) ? base_pos : base_pos - 1;
+    uint32_t local_inst   = active_ids[ai];
+    uint32_t region_start = prefix[prefix_base_addr];
+    uint32_t base_pos     = region_start + local_inst * INSTANCE_SIZE;
+    uint32_t halo_base    = (local_inst == 0) ? base_pos : base_pos - 1;
 
     uint32_t* out = addr_offsets + offset_starts[ai];
     uint32_t tid = threadIdx.x;
@@ -429,10 +492,10 @@ __global__ void compute_addr_offsets_kernel(
 struct InstanceMeta {
     uint32_t inst_id;            // local instance ID within region
     uint8_t  type;               // REGION_ROM / REGION_INPUT / REGION_RAM
-    uint32_t first_addr;         // first compact address covered
-    uint32_t last_addr;          // last compact address covered
-    const uint32_t* nops_per_chunk;  // per-chunk op counts (pinned, not owned)
-    uint32_t* addr_offsets;          // per-address scatter offsets (pinned, not owned)
+    uint32_t first_addr;         // first raw hardware address covered
+    uint32_t last_addr;          // last raw hardware address covered
+    std::vector<uint32_t> nops_per_chunk;  // per-chunk op counts
+    std::vector<uint32_t> addr_offsets;    // per-address scatter offsets
     uint32_t first_addr_chunk;   // chunk where first-address data begins
     uint32_t first_addr_skip;    // entries to skip in first_addr_chunk
     uint32_t last_addr_chunk;    // chunk where last-address data ends
@@ -539,6 +602,11 @@ PairSortGPU::PairSortGPU()
     d_temp_bytes = 0;
     cub::DeviceScan::ExclusiveSum(d_temp, d_temp_bytes, d_hist, d_prefix, N_ADDR);
     cudaMalloc(&d_temp, d_temp_bytes);
+
+    for (auto& m : metas) {
+        m.nops_per_chunk.reserve(MAX_CHUNKS);
+        m.addr_offsets.reserve(INSTANCE_SIZE + 1);
+    }
 
     cudaMalloc(&d_active_ids,    MAX_ACTIVE * sizeof(uint32_t));
     cudaMalloc(&d_active_first,  MAX_ACTIVE * sizeof(uint32_t));
@@ -825,26 +893,26 @@ void PairSortGPU::gpu_metadata() {
 
     pick_active_instances();
 
-    // Per-region instance boundaries + chunk FML counts
-    int fml_block, fml_grid;
-    cudaOccupancyMaxPotentialBlockSize(&fml_grid, &fml_block, chunk_fml_count_kernel, 0, 0);
+    // Instance boundaries (per-region, cheap)
     cudaMemset(d_fml, 0, (size_t)num_active * num_chunks * 3 * sizeof(uint32_t));
-
     for (uint8_t r = 0; r < 3; r++) {
         if (num_active_per[r] == 0) continue;
         uint32_t na  = num_active_per[r];
         uint32_t off = active_offset[r];
-
         instance_boundaries_kernel<<<1, na>>>(
             d_prefix, REGION_ADDR_START[r], REGION_N_ADDR[r],
-            region_n_ops[r], region_ops_start[r],
+            region_n_ops[r],
             d_active_ids + off, d_active_first + off, d_active_last + off,
             d_offset_starts + off, na);
-
-        chunk_fml_count_kernel<<<fml_grid, fml_block>>>(
-            d_ops, d_active_first + off, d_active_last + off, d_chunk_offsets,
-            d_fml + (size_t)off * num_chunks * 3, na, num_chunks, num_ops);
     }
+
+    // Chunk FML counts — single pass over all ops for all active instances
+    int fml_block, fml_grid;
+    cudaOccupancyMaxPotentialBlockSize(&fml_grid, &fml_block, chunk_fml_count_kernel, 0, 0);
+    chunk_fml_count_kernel<<<fml_grid, fml_block>>>(
+        d_ops, d_active_first, d_active_last, d_chunk_offsets,
+        d_fml, num_active, num_chunks, num_ops);
+
     cudaDeviceSynchronize();
 
     // D2H: active boundaries
@@ -870,13 +938,13 @@ void PairSortGPU::gpu_metadata() {
 
         build_metas_kernel<<<na, 256, 0, meta_stream>>>(
             d_fml + (size_t)off * num_chunks * 3, d_prefix,
-            region_n_ops[r], region_ops_start[r],
+            REGION_ADDR_START[r], region_n_ops[r],
             d_active_ids + off, d_active_first + off, d_active_last + off,
             d_result_nops + (size_t)off * num_chunks,
             d_meta_scalars + off * 4, na, num_chunks);
 
         compute_addr_offsets_kernel<<<na, 1024, 0, d2h_stream>>>(
-            d_prefix, region_n_ops[r], region_ops_start[r],
+            d_prefix, REGION_ADDR_START[r], region_n_ops[r],
             d_active_ids + off, d_active_first + off, d_active_last + off,
             d_addr_offsets, d_offset_starts + off, na);
     }
@@ -898,14 +966,21 @@ void PairSortGPU::gpu_metadata() {
             uint32_t* scalars      = h_meta_scalars + ai * 4;
             metas[ai].inst_id      = h_active_local_ids[active_offset[r] + j];
             metas[ai].type         = r;
-            metas[ai].first_addr   = h_active_first[ai];
-            metas[ai].last_addr    = h_active_last[ai];
-            metas[ai].first_addr_chunk   = scalars[0];
-            metas[ai].first_addr_skip    = scalars[1];
-            metas[ai].last_addr_chunk    = scalars[2];
-            metas[ai].last_addr_include  = scalars[3];
-            metas[ai].addr_offsets       = h_offsets_buf + h_offset_starts[ai];
-            metas[ai].nops_per_chunk     = h_result_nops + (size_t)ai * num_chunks;
+            metas[ai].first_addr   = expand_addr(h_active_first[ai]);
+            metas[ai].last_addr    = expand_addr(h_active_last[ai]);
+            metas[ai].first_addr_chunk  = scalars[0];
+            metas[ai].first_addr_skip   = scalars[1];
+            metas[ai].last_addr_chunk   = scalars[2];
+            metas[ai].last_addr_include = scalars[3];
+            uint32_t num_addrs = h_active_last[ai] - h_active_first[ai] + 1;
+            metas[ai].nops_per_chunk.resize(num_chunks);
+            memcpy(metas[ai].nops_per_chunk.data(),
+                   h_result_nops + (size_t)ai * num_chunks,
+                   num_chunks * sizeof(uint32_t));
+            metas[ai].addr_offsets.resize(num_addrs);
+            memcpy(metas[ai].addr_offsets.data(),
+                   h_offsets_buf + h_offset_starts[ai],
+                   num_addrs * sizeof(uint32_t));
         }
     }
 
@@ -946,13 +1021,13 @@ void PairSortGPU::cpu_fill() {
 
             for (uint32_t j = 0; j < chunk_size && found < expected; j++) {
                 uint32_t raw  = h_ops[chunk_start + j];
+                if (raw < m.first_addr || raw > m.last_addr) continue;
                 uint32_t addr = compact_addr(raw);
-                if (addr < m.first_addr || addr > m.last_addr) continue;
-                uint32_t ind = addr - m.first_addr;
+                uint32_t ind  = addr - compact_addr(m.first_addr);
                 found++;
 
                 bool skip = false;
-                if (addr == m.first_addr) {
+                if (raw == m.first_addr) {
                     first_found++;
                     if (chunk < m.first_addr_chunk) skip = true;
                     else if (chunk == m.first_addr_chunk && first_found <= m.first_addr_skip) skip = true;
@@ -960,7 +1035,7 @@ void PairSortGPU::cpu_fill() {
                         if (chunk > m.last_addr_chunk) skip = true;
                         else if (chunk == m.last_addr_chunk && first_found > m.last_addr_include) skip = true;
                     }
-                } else if (addr == m.last_addr) {
+                } else if (raw == m.last_addr) {
                     last_found++;
                     if (chunk > m.last_addr_chunk) skip = true;
                     else if (chunk == m.last_addr_chunk && last_found > m.last_addr_include) skip = true;
