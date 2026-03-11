@@ -6,6 +6,7 @@
 #include <iostream>
 #include <omp.h>
 #include <random>
+#include <span>
 #include <vector>
 #include <cub/device/device_scan.cuh>
 
@@ -507,8 +508,8 @@ struct InstanceMeta {
     uint8_t  type;               // REGION_ROM / REGION_INPUT / REGION_RAM
     uint32_t first_addr;         // first raw hardware address covered
     uint32_t last_addr;          // last raw hardware address covered
-    std::vector<uint32_t> nops_per_chunk;  // per-chunk op counts
-    std::vector<uint32_t> addr_offsets;    // per-address scatter offsets
+    std::span<const uint32_t> nops_per_chunk;  // view into pinned h_result_nops
+    std::span<uint32_t>       addr_offsets;    // view into pinned h_offsets_buf
     uint32_t first_addr_chunk;   // chunk where first-address data begins
     uint32_t first_addr_skip;    // entries to skip in first_addr_chunk
     uint32_t last_addr_chunk;    // chunk where last-address data ends
@@ -616,10 +617,6 @@ PairSortGPU::PairSortGPU()
     cub::DeviceScan::ExclusiveSum(d_temp, d_temp_bytes, d_hist, d_prefix, N_ADDR);
     cudaMalloc(&d_temp, d_temp_bytes);
 
-    for (auto& m : metas) {
-        m.nops_per_chunk.reserve(MAX_CHUNKS);
-        m.addr_offsets.reserve(INSTANCE_SIZE + 1);
-    }
 
     cudaMalloc(&d_active_ids,    MAX_ACTIVE * sizeof(uint32_t));
     cudaMalloc(&d_active_first,  MAX_ACTIVE * sizeof(uint32_t));
@@ -986,14 +983,8 @@ void PairSortGPU::gpu_metadata() {
             metas[ai].last_addr_chunk   = scalars[2];
             metas[ai].last_addr_include = scalars[3];
             uint32_t num_addrs = h_active_last[ai] - h_active_first[ai] + 1;
-            metas[ai].nops_per_chunk.resize(num_chunks);
-            memcpy(metas[ai].nops_per_chunk.data(),
-                   h_result_nops + (size_t)ai * num_chunks,
-                   num_chunks * sizeof(uint32_t));
-            metas[ai].addr_offsets.resize(num_addrs);
-            memcpy(metas[ai].addr_offsets.data(),
-                   h_offsets_buf + h_offset_starts[ai],
-                   num_addrs * sizeof(uint32_t));
+            metas[ai].nops_per_chunk = {h_result_nops + (size_t)ai * num_chunks, num_chunks};
+            metas[ai].addr_offsets   = {h_offsets_buf + h_offset_starts[ai], num_addrs};
         }
     }
 
