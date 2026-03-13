@@ -1026,8 +1026,7 @@ void PairSortGPU::cpu_fill() {
             for (uint32_t j = 0; j < chunk_size && found < expected; j++) {
                 uint32_t raw  = h_ops[chunk_start + j];
                 if (raw < m.first_addr || raw > m.last_addr) continue;
-                uint32_t addr = compact_addr(raw);
-                uint32_t ind  = addr - compact_addr(m.first_addr);
+                uint32_t ind  = (raw - m.first_addr) >> 3;
                 found++;
 
                 bool skip = false;
