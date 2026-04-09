@@ -94,17 +94,21 @@ __global__ void shift_and_histogram_kernel(uint32_t* ops, uint32_t* hist, uint32
 }
 
 // Finds first/last compact addresses for each active instance via binary
-// search on the prefix-sum array. Also computes offset_starts for the
-// addr_offsets buffer. RR := region-relative (caller passes base pointer + region offset).
+// search on the prefix-sum array. Also computes offset_starts — packing offsets
+// used later by compute_addr_offsets_kernel to store per-address write positions
+// contiguously across all instances.
+//
+// Pointers marked (*) are pre-offset by the caller for this region's slice of
+// the global arrays (e.g., caller passes d_active_ids + active_offset[region]).
 //
 // Input:  prefix[N_ADDR+1]               — exclusive prefix sum of histogram
 // Input:  prefix_base_addr               — first compact address of this region
 // Input:  num_addr_region                — number of compact addresses in this region
 // Input:  num_ops_region                 — total ops in this region
-// Input:  active_ids[num_active]    (RR) — local instance IDs of active instances
-// Output: active_first[num_active]  (RR) — first compact address per active instance
-// Output: active_last[num_active]   (RR) — last compact address per active instance
-// Output: offset_starts[num_active] (RR) — write offset into addr_offsets per active instance
+// Input:  active_ids[num_active]     (*) — local instance IDs of active instances
+// Output: active_first[num_active]   (*) — first compact address per active instance
+// Output: active_last[num_active]    (*) — last compact address per active instance
+// Output: offset_starts[num_active]  (*) — start index per instance into packed addr_offsets
 // Input:  num_active                     — number of active instances in this region
 __global__ void instance_boundaries_kernel(
     const uint32_t* prefix,
@@ -240,18 +244,20 @@ __global__ void chunk_fml_count_kernel(
 }
 
 // Builds per-instance metadata on GPU (one block per active instance, 256 threads).
-// Parameters marked (RR) are region-relative (caller passes base pointer + region offset).
 //
-// Input:  d_fml[num_active * num_chunks * 3]  (RR) — first/middle/last counts
-// Input:  prefix[N_ADDR+1]                         — exclusive prefix sum of histogram
-// Input:  prefix_base_addr                         — first compact address of this region
-// Input:  num_ops_region                           — total ops in this region
-// Input:  active_ids[num_active]              (RR) — local instance IDs in this region
-// Input:  active_first[num_active]            (RR) — first compact address per instance
-// Input:  active_last[num_active]             (RR) — last compact address per instance
-// Output: result_nops[num_active * num_chunks](RR) — per-chunk op count (0=eliminated)
-// Output: meta_scalars[num_active * 4]        (RR) — [fa_chunk, fa_skip, la_chunk, la_include]
-// Input:  num_active, num_chunks                   — dimensions
+// Pointers marked (*) are pre-offset by the caller for this region's slice of
+// the global arrays (e.g., caller passes d_active_ids + active_offset[region]).
+//
+// Input:  d_fml[num_active * num_chunks * 3]  (*) — first/middle/last counts
+// Input:  prefix[N_ADDR+1]                        — exclusive prefix sum of histogram
+// Input:  prefix_base_addr                        — first compact address of this region
+// Input:  num_ops_region                          — total ops in this region
+// Input:  active_ids[num_active]              (*) — local instance IDs in this region
+// Input:  active_first[num_active]            (*) — first compact address per instance
+// Input:  active_last[num_active]             (*) — last compact address per instance
+// Output: result_nops[num_active * num_chunks](*) — per-chunk op count (0=eliminated)
+// Output: meta_scalars[num_active * 4]        (*) — [fa_chunk, fa_skip, la_chunk, la_include]
+// Input:  num_active, num_chunks                  — dimensions
 __global__ void build_metas_kernel(
     const uint32_t* d_fml,
     const uint32_t* prefix,
@@ -459,15 +465,18 @@ __global__ void build_metas_kernel(
 // For each address in an instance's range, stores the offset into the instance's
 // output buffer where ops at that address should be written.
 //
-// Input:  prefix[N_ADDR+1]                 — exclusive prefix sum of histogram
-// Input:  prefix_base_addr                 — first compact address of this region
-// Input:  num_ops_region                   — total ops in this region
-// Input:  active_ids[num_active]      (RR) — local instance IDs in this region
-// Input:  active_first[num_active]    (RR) — first compact address per instance
-// Input:  active_last[num_active]     (RR) — last compact address per instance
-// Output: addr_offsets[total_addrs]   (RR) — write offset per address per instance
-// Input:  offset_starts[num_active]   (RR) — start index in addr_offsets per instance
-// Input:  num_active                       — number of active instances in this region
+// Pointers marked (*) are pre-offset by the caller for this region's slice of
+// the global arrays (e.g., caller passes d_active_ids + active_offset[region]).
+//
+// Input:  prefix[N_ADDR+1]                — exclusive prefix sum of histogram
+// Input:  prefix_base_addr                — first compact address of this region
+// Input:  num_ops_region                  — total ops in this region
+// Input:  active_ids[num_active]      (*) — local instance IDs in this region
+// Input:  active_first[num_active]    (*) — first compact address per instance
+// Input:  active_last[num_active]     (*) — last compact address per instance
+// Output: addr_offsets[total_addrs]   (*) — write offset per address per instance
+// Input:  offset_starts[num_active]   (*) — start index in addr_offsets per instance
+// Input:  num_active                      — number of active instances in this region
 __global__ void compute_addr_offsets_kernel(
     const uint32_t* prefix,
     uint32_t prefix_base_addr, uint32_t num_ops_region,
